@@ -1,0 +1,54 @@
+{
+  "sync_settings": {
+    "description": "Test configuration for Mamori sync operations. Set to 1 to sync, 0 to skip.",
+    "version": "1.0"
+  },
+  "sync_objects": {
+    "directory_users": 0,
+    "mamori_users": 1,
+    "providers": 0,
+    "alert_channels": 1,
+    "connection_policies_before": 1,
+    "connection_policies_after": 1,
+    "ip_resources": 1,
+    "remote_desktop_logins": 1,
+    "http_resources": 1,
+    "secrets": 1,
+    "encryption_keys": 1,
+    "ssh_logins": 1,
+    "requestable_resources": 1,
+    "roles": 1,
+    "role_grants": 1,
+    "role_permissions": 1,
+    "on_demand_policies": 1
+  },
+  "sync_options": {
+    "create_new": true,
+    "update_existing": true,
+    "delete_removed": true,
+    "batch_size": 1000,
+    "log_level": "info",
+    "test_mode": false,
+    "test_limit": 1000
+  },
+  "object_filters": {
+    "description": "Filter specific objects by name patterns. Use regex patterns or exact names. Leave empty to sync all objects.",
+    "providers": [],
+    "directory_users": [],
+    "mamori_users": [],
+    "secrets": [],
+    "encryption_keys": [],
+    "ssh_logins": [],
+    "roles": [],
+    "role_grants": [],
+    "role_permissions": [],
+    "alert_channels": [],
+    "connection_policies_before": [],
+    "connection_policies_after": [],
+    "ip_resources": [],
+    "remote_desktop_logins": [],
+    "http_resources": [],
+    "requestable_resources": [],
+    "on_demand_policies": []
+  }
+}

@@ -1,0 +1,14 @@
+FROM mamori-api-runner
+
+# Add lodash and moment libraries (included by default)
+RUN yarn add lodash moment
+
+# Add type definitions for TypeScript support
+RUN yarn add --dev @types/lodash
+
+# Add your custom libraries here:
+# RUN yarn add axios fs-extra uuid
+# RUN yarn add --dev @types/uuid
+
+# Example: Adding a specific version
+# RUN yarn add lodash@4.17.21 moment@2.29.4

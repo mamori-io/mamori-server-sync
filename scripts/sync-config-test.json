@@ -1,0 +1,32 @@
+{
+  "sync_settings": {
+    "description": "Test configuration for Mamori sync operations. Set to 1 to sync, 0 to skip.",
+    "version": "1.0"
+  },
+  "sync_objects": {
+    "directory_users": 1,
+    "mamori_users": 1,
+    "alert_channels": 0,
+    "connection_policies_before": 0,
+    "connection_policies_after": 0,
+    "ip_resources": 0,
+    "remote_desktop_logins": 0,
+    "http_resources": 0,
+    "secrets": 0,
+    "ssh_logins": 0,
+    "requestable_resources": 0,
+    "roles": 1,
+    "role_grants": 0,
+    "role_permissions": 0,
+    "on_demand_policies": 0
+  },
+  "sync_options": {
+    "create_new": true,
+    "update_existing": true,
+    "delete_removed": true,
+    "batch_size": 1000,
+    "log_level": "info",
+    "test_mode": true,
+    "test_limit": 1
+  }
+}

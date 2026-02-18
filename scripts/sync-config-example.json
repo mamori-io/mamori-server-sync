@@ -1,0 +1,109 @@
+{
+  "sync_settings": {
+    "description": "Example configuration file for Mamori sync operations. Set to 1 to sync, 0 to skip.",
+    "version": "1.0"
+  },
+  "sync_objects": {
+    "directory_users": 1,
+    "mamori_users": 1,
+    "providers": 1,
+    "alert_channels": 0,
+    "connection_policies_before": 1,
+    "connection_policies_after": 1,
+    "ip_resources": 1,
+    "remote_desktop_logins": 0,
+    "http_resources": 0,
+    "secrets": 1,
+    "encryption_keys": 1,
+    "ssh_logins": 1,
+    "requestable_resources": 1,
+    "roles": 1,
+    "role_grants": 1,
+    "role_permissions": 1,
+    "on_demand_policies": 0
+  },
+  "sync_options": {
+    "create_new": true,
+    "update_existing": true,
+    "delete_removed": true,
+    "batch_size": 1000,
+    "log_level": "info",
+    "test_mode": false,
+    "test_limit": 1000
+  },
+  "object_filters": {
+    "description": "Filter specific objects by name patterns. Use regex patterns or exact names. Leave empty to sync all objects.",
+    "providers": [
+      "azuread.*",
+      "admin",
+      ".*ldap.*"
+    ],
+    "directory_users": [
+      "admin.*",
+      "test.*",
+      "omasri"
+    ],
+    "mamori_users": [
+      ".*admin.*",
+      "readonly",
+      ".*manager.*"
+    ],
+    "secrets": [
+      "prod.*",
+      "database.*",
+      "api_key"
+    ],
+    "encryption_keys": [
+      ".*aes.*",
+      "rsa.*",
+      "ssh.*"
+    ],
+    "ssh_logins": [
+      "prod.*",
+      ".*server.*",
+      "backup"
+    ],
+    "roles": [
+      ".*admin.*",
+      "readonly",
+      ".*manager.*"
+    ],
+    "role_grants": [],
+    "role_permissions": [],
+    "alert_channels": [
+      "email.*",
+      "slack.*",
+      "webhook"
+    ],
+    "connection_policies_before": [
+      ".*prod.*",
+      ".*admin.*"
+    ],
+    "connection_policies_after": [
+      ".*prod.*",
+      ".*admin.*"
+    ],
+    "ip_resources": [
+      ".*prod.*",
+      ".*admin.*",
+      ".*server.*"
+    ],
+    "remote_desktop_logins": [
+      ".*prod.*",
+      ".*admin.*"
+    ],
+    "http_resources": [
+      ".*prod.*",
+      ".*api.*",
+      ".*admin.*"
+    ],
+    "requestable_resources": [
+      ".*prod.*",
+      ".*admin.*"
+    ],
+    "on_demand_policies": [
+      ".*prod.*",
+      ".*admin.*"
+    ]
+  }
+}
