@@ -1,8 +1,5 @@
 FROM mamori-api-runner
 
-# Polyfill global fetch when runtime has no fetch (mamori-ent-js-sdk); harmless on Node 18+
-RUN yarn add undici
-
 # Add lodash and moment libraries (included by default)
 RUN yarn add lodash moment
 

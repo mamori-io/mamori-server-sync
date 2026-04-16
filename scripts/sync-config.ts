@@ -1,5 +1,3 @@
-import './fetch-polyfill';
-
 import {
     MamoriService, io_https
     , io_utils
