@@ -17,8 +17,11 @@ PREREQUISITES
 QUICK START (7 Simple Steps)
 ============================
 
-1. **Place Docker Image**
-   Place `mamori-api-runner.tgz` in the root directory of this project.
+1. **Load Api Runner Docker Image**
+   Place `mamori-api-runner.tgz` in the root directory of this project and load it.
+
+   docker image load < mamori-api-runner.tgz
+
 
 2. **Add Custom Libraries (Optional)**
    Edit `Dockerfile.custom` to add any additional npm libraries you need:
