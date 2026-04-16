@@ -1,3 +1,5 @@
+import './fetch-polyfill';
+
 import {
     MamoriService, io_https
     , io_utils
@@ -681,11 +683,12 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
         return;
     }
 
+    // Declared outside try so finally can cleanup (let in try is not visible in finally)
+    let tempAESKey: any = null;
     try {
         logMain("Starting Mamori users synchronization...");
         
         // Create temporary AES key for MFA options export/restore
-        let tempAESKey: any = null;
         try {
             tempAESKey = await createTemporaryAESKey(api, apiKC);
             logMain(`✅ Created temporary AES key for MFA sync: ${tempAESKey.keyName}`);
@@ -719,7 +722,8 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 // Check if user has MFA and export options if available
                 let mfaInfo = { provider: 'none', hasMFA: false, encryptedValue: null as string | null };
                 if (tempAESKey) {
-                    let mfaInfo = await getUserMFAProvider(api, r.username);
+                    const fetched = await getUserMFAProvider(api, r.username);
+                    mfaInfo = { ...fetched, encryptedValue: null as string | null };
                     if (mfaInfo.hasMFA) {
                         logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
                         const encryptedValue = await exportUserMFAOptions(api, r.username, mfaInfo.provider, tempAESKey.keyName);
@@ -785,7 +789,8 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 // Check if user has MFA and export options if available
                 let mfaInfo = { provider: 'none', hasMFA: false, encryptedValue: null as string | null };
                 if (tempAESKey) {
-                    mfaInfo = await getUserMFAProvider(api, r.username);
+                    const fetched = await getUserMFAProvider(api, r.username);
+                    mfaInfo = { ...fetched, encryptedValue: null as string | null };
                     if (mfaInfo.hasMFA) {
                         logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
                         const encryptedValue = await exportUserMFAOptions(api, r.username, mfaInfo.provider, tempAESKey.keyName);
@@ -859,7 +864,7 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
         
     } catch (error) {
         logError(`Mamori users sync failed: ${error}`);
-        } finally {
+    } finally {
         // Cleanup temporary AES key
         if (tempAESKey && tempAESKey.cleanup) {
             try {
@@ -2726,8 +2731,20 @@ async function extractQueries() {
 // ========================================
 extractQueries()
     .catch(e => {
-        const errorMsg = e.response?.data ? e.response.data : e.toString();
-        logError(`Fatal error: ${errorMsg}`);
+        const ax = e as { response?: { status?: number; data?: unknown }; message?: string };
+        const status = ax.response?.status;
+        const data = ax.response?.data;
+        const body =
+            data == null
+                ? ''
+                : typeof data === 'object'
+                  ? JSON.stringify(data)
+                  : String(data);
+        const parts = [
+            status != null ? `HTTP ${status}` : null,
+            body || ax.message || String(e),
+        ].filter(Boolean);
+        logError(`Fatal error: ${parts.join(' — ')}`);
         process.exit(1);
     })
     .finally(() => {

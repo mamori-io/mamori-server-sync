@@ -4,23 +4,21 @@
     "version": "1.0"
   },
   "sync_objects": {
-    "directory_users": 0,
+    "directory_users": 1,
     "mamori_users": 1,
-    "providers": 0,
-    "alert_channels": 1,
-    "connection_policies_before": 1,
-    "connection_policies_after": 1,
-    "ip_resources": 1,
-    "remote_desktop_logins": 1,
-    "http_resources": 1,
-    "secrets": 1,
-    "encryption_keys": 1,
-    "ssh_logins": 1,
-    "requestable_resources": 1,
+    "alert_channels": 0,
+    "connection_policies_before": 0,
+    "connection_policies_after": 0,
+    "ip_resources": 0,
+    "remote_desktop_logins": 0,
+    "http_resources": 0,
+    "secrets": 0,
+    "ssh_logins": 0,
+    "requestable_resources": 0,
     "roles": 1,
-    "role_grants": 1,
-    "role_permissions": 1,
-    "on_demand_policies": 1
+    "role_grants": 0,
+    "role_permissions": 0,
+    "on_demand_policies": 0
   },
   "sync_options": {
     "create_new": true,
@@ -28,27 +26,7 @@
     "delete_removed": true,
     "batch_size": 1000,
     "log_level": "info",
-    "test_mode": false,
-    "test_limit": 1000
-  },
-  "object_filters": {
-    "description": "Filter specific objects by name patterns. Use regex patterns or exact names. Leave empty to sync all objects.",
-    "providers": [],
-    "directory_users": [],
-    "mamori_users": [],
-    "secrets": [],
-    "encryption_keys": [],
-    "ssh_logins": [],
-    "roles": [],
-    "role_grants": [],
-    "role_permissions": [],
-    "alert_channels": [],
-    "connection_policies_before": [],
-    "connection_policies_after": [],
-    "ip_resources": [],
-    "remote_desktop_logins": [],
-    "http_resources": [],
-    "requestable_resources": [],
-    "on_demand_policies": []
+    "test_mode": true,
+    "test_limit": 1
   }
 }
