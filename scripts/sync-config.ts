@@ -15,6 +15,8 @@ import {
     , io_requestable_resource
     , io_key
     , io_providers
+    , io_datasource
+    , io_db_credential
 } from 'mamori-ent-js-sdk';
 
 import { createTemporaryAESKey, TempAESKey } from './aes-key-manager';
@@ -22,13 +24,11 @@ import { createTemporaryAESKey, TempAESKey } from './aes-key-manager';
 const mamoriUrl = process.env.MAMORI_SERVER || '';
 const mamoriUser = process.env.MAMORI_USERNAME || '';
 const mamoriPwd = process.env.MAMORI_PASSWORD || '';
-const adProvider1 = process.env.MAMORI_AD_PROVIDER || '';
 const aesKey = process.env.MAMORI_AES_KEY || '';
 
 const mamoriKCUrl = process.env.MAMORI_SERVER2 || '';
 const mamoriKCUser = process.env.MAMORI_USERNAME2 || '';
 const mamoriKCPwd = process.env.MAMORI_PASSWORD2 || '';
-const adProvider2 = process.env.MAMORI_AD_PROVIDER2 || '';
 
 const INSECURE = new io_https.Agent({ rejectUnauthorized: false });
 
@@ -105,8 +105,11 @@ try {
                 roles: 1,
                 role_grants: 1,
                 role_permissions: 1,
-                on_demand_policies: 1
-            }
+                on_demand_policies: 1,
+                datasources: 1,
+                datasource_credentials: 1
+            },
+            provider_mappings: []
         };
     }
 } catch (error) {
@@ -128,8 +131,11 @@ try {
             roles: 1,
             role_grants: 1,
             role_permissions: 1,
-            on_demand_policies: 1
-        }
+            on_demand_policies: 1,
+            datasources: 1,
+            datasource_credentials: 1
+        },
+        provider_mappings: []
     };
 }
 
@@ -160,6 +166,374 @@ function shouldSyncObject(objectType: string, objectName: string): boolean {
             return objectName.toLowerCase() === filter.toLowerCase();
         }
     });
+}
+
+function shouldSyncDatasourceCredentialObject(credential: any): boolean {
+    const datasourceName = credential.systemname || credential.datasource || '';
+    const credentialIdentity = `${datasourceName}|${credential.accessname || ''}|${credential.grantee || ''}`;
+
+    // A datasource credential should pass both the datasource filter and
+    // its own credential-level filter (if configured).
+    return shouldSyncObject('datasources', datasourceName) &&
+        shouldSyncObject('datasource_credentials', credentialIdentity);
+}
+
+function normalizeProviderName(provider: string): string {
+    if (!provider) {
+        return '';
+    }
+
+    return provider.split('/')[0].toLowerCase();
+}
+
+function getMappedTargetProvider(sourceProvider: string): string {
+    const normalizedSource = normalizeProviderName(sourceProvider);
+    const mappings = syncConfig.provider_mappings as Array<{ source_provider?: string; target_provider?: string }> || [];
+
+    const mapped = mappings.find((m: any) => normalizeProviderName(m?.source_provider || '') === normalizedSource);
+    if (mapped?.target_provider) {
+        return normalizeProviderName(mapped.target_provider);
+    }
+
+    return normalizedSource;
+}
+
+function getObjectFilters(objectType: string): string[] {
+    return syncConfig.object_filters?.[objectType as keyof typeof syncConfig.object_filters] as string[] || [];
+}
+
+function buildUserSearchPayload(objectType: string): any {
+    const payload: any = { skip: 0, take: 1000 };
+    const filters = getObjectFilters(objectType);
+
+    // Push down filters to the backend search API when supported.
+    if (filters.length > 0) {
+        payload.filters = filters;
+        payload.username_filters = filters;
+    }
+
+    return payload;
+}
+
+async function fetchDirectoryUsers(api: any): Promise<any[]> {
+    const payload = buildUserSearchPayload('directory_users');
+    const result = await io_utils.noThrow(api.callAPI("PUT", "/v1/search/directory_users", payload));
+    let users = normalizeArrayResult(result);
+
+    // Safety net in case backend ignores the pushed-down filters.
+    users = users.filter((user: any) => shouldSyncObject('directory_users', user.username || ''));
+    return users;
+}
+
+async function fetchMamoriUsers(api: any): Promise<any[]> {
+    const payload = buildUserSearchPayload('mamori_users');
+    const mamoriUserFilters = getObjectFilters('mamori_users');
+
+    // Try search endpoints first so filters can be pushed down.
+    if (mamoriUserFilters.length > 0) {
+        const candidateEndpoints = ["/v1/search/mamori_users", "/v1/search/users"];
+        for (const endpoint of candidateEndpoints) {
+            const result = await io_utils.noThrow(api.callAPI("PUT", endpoint, payload));
+            if (!result?.errors) {
+                let users = normalizeArrayResult(result);
+                users = users.filter((user: any) => shouldSyncObject('mamori_users', user.username || ''));
+                return users;
+            }
+        }
+    }
+
+    // Fallback path for older APIs that only expose SDK list.
+    let users = normalizeArrayResult(await io_utils.noThrow(io_user.User.list(api, 0, 1000)));
+    users = users.filter((user: any) => shouldSyncObject('mamori_users', user.username || ''));
+    return users;
+}
+
+function normalizeArrayResult(result: any): any[] {
+    if (Array.isArray(result)) {
+        return result;
+    }
+    if (Array.isArray(result?.data)) {
+        return result.data;
+    }
+    return [];
+}
+
+type ExportedMFAInfo = {
+    provider: string;
+    hasMFA: boolean;
+    encryptedValue: string | null;
+};
+
+function normalizeUserDisabled(user: any): boolean | null {
+    if (!user || typeof user !== 'object') {
+        return null;
+    }
+    if (typeof user.disabled === 'boolean') return user.disabled;
+    if (typeof user.disabled === 'string') {
+        if (user.disabled.toLowerCase() === 'true') return true;
+        if (user.disabled.toLowerCase() === 'false') return false;
+    }
+    if (typeof user.is_disabled === 'boolean') return user.is_disabled;
+    if (typeof user.is_disabled === 'string') {
+        if (user.is_disabled.toLowerCase() === 'true') return true;
+        if (user.is_disabled.toLowerCase() === 'false') return false;
+    }
+    if (typeof user.isdisabled === 'boolean') return user.isdisabled;
+    if (typeof user.isdisabled === 'string') {
+        if (user.isdisabled.toLowerCase() === 'true') return true;
+        if (user.isdisabled.toLowerCase() === 'false') return false;
+    }
+    if (typeof user.account_disabled === 'boolean') return user.account_disabled;
+    if (typeof user.account_disabled === 'string') {
+        if (user.account_disabled.toLowerCase() === 'true') return true;
+        if (user.account_disabled.toLowerCase() === 'false') return false;
+    }
+    if (typeof user.enabled === 'boolean') return !user.enabled;
+    if (typeof user.status === 'string') {
+        const status = user.status.toLowerCase();
+        if (status === 'disabled') return true;
+        if (status === 'enabled' || status === 'active') return false;
+    }
+    return null;
+}
+
+/** Tab-separated auth providers from user search rows; used to detect MFA / provider drift vs target. */
+function normalizeUserProvidersString(user: any): string {
+    if (!user || typeof user !== "object") {
+        return "";
+    }
+    return String(user.providers ?? "")
+        .replace(/\r/g, "")
+        .trim();
+}
+
+/**
+ * GET /v1/users/:name/options returns the JSON body of SELECT * FROM SYS.USER_OPTIONS — an array of
+ * { username, option_name, option_value } rows — not a single object with authenticated_by_primary.
+ */
+function extractUserOptionsRows(result: any): any[] {
+    if (!result || result.errors) {
+        return [];
+    }
+    if (Array.isArray(result)) {
+        return result;
+    }
+    if (result.data !== undefined && Array.isArray(result.data)) {
+        return result.data;
+    }
+    if (Array.isArray(result.rows)) {
+        return result.rows;
+    }
+    return [];
+}
+
+/** Non-password provider names from tab-separated `providers` (e.g. password\\tpushtotp). */
+function inferMfaProviderFromProvidersTabString(providersTab: string): { provider: string; hasMFA: boolean } {
+    const raw = String(providersTab ?? "")
+        .replace(/\r/g, "")
+        .trim();
+    if (!raw) {
+        return { provider: "none", hasMFA: false };
+    }
+    const parts = raw
+        .split("\t")
+        .map((p: string) => normalizeProviderName((p || "").replace(/\r/g, "").trim()))
+        .filter(
+            (p: string) =>
+                !!p && p !== "password" && p !== "none",
+        );
+    if (parts.length === 0) {
+        return { provider: "none", hasMFA: false };
+    }
+    return { provider: parts[0], hasMFA: true };
+}
+
+function inferMfaFromUserOptionRows(rows: any[], providersHintTab: string): { provider: string; hasMFA: boolean } {
+    const hint = (providersHintTab || "").toLowerCase();
+    for (const row of rows) {
+        const name = String(row?.option_name ?? row?.OPTION_NAME ?? "").toLowerCase();
+        if (name === "secret_mobile_identifier") {
+            return { provider: "pushmobile", hasMFA: true };
+        }
+        if (name === "secret") {
+            if (hint.includes("pushtotp")) {
+                return { provider: "pushtotp", hasMFA: true };
+            }
+            if (hint.includes("totp") && !hint.includes("pushtotp")) {
+                return { provider: "totp", hasMFA: true };
+            }
+            return { provider: "pushtotp", hasMFA: true };
+        }
+    }
+    return { provider: "none", hasMFA: false };
+}
+
+async function exportUserMFAIfPresent(
+    api: any,
+    username: string,
+    aesKeyName: string,
+    sourceUserRow?: any,
+): Promise<ExportedMFAInfo> {
+    const mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
+    const providersHintTab = sourceUserRow ? normalizeUserProvidersString(sourceUserRow) : "";
+    const sourceMfaInfo = await getUserMFAProvider(api, username, providersHintTab);
+    mfaInfo.provider = sourceMfaInfo.provider;
+    mfaInfo.hasMFA = sourceMfaInfo.hasMFA;
+    if (!mfaInfo.hasMFA) {
+        return mfaInfo;
+    }
+    const encryptedValue = await exportUserMFAOptions(api, username, mfaInfo.provider, aesKeyName);
+    if (encryptedValue) {
+        mfaInfo.encryptedValue = encryptedValue;
+    }
+    return mfaInfo;
+}
+
+async function restoreUserMFAIfAvailable(
+    apiKC: any,
+    username: string,
+    targetProvider: string,
+    aesKeyName: string,
+    mfaInfo: ExportedMFAInfo,
+    userTypeLabel: string
+): Promise<void> {
+    if (!mfaInfo.hasMFA) {
+        logDetail(`${userTypeLabel} ${username} has no MFA provider to sync`);
+        return;
+    }
+    if (!mfaInfo.encryptedValue) {
+        logError(`Skipping MFA restore for ${userTypeLabel.toLowerCase()} ${username}: no exported MFA payload available`);
+        return;
+    }
+    const normalizedTargetProvider = normalizeProviderName(targetProvider || '');
+    if (!normalizedTargetProvider || normalizedTargetProvider === 'none' || normalizedTargetProvider === 'password') {
+        logError(`Skipping MFA restore for ${userTypeLabel.toLowerCase()} ${username}: invalid target provider "${targetProvider}"`);
+        return;
+    }
+    logDetail(`Restoring MFA options for ${userTypeLabel.toLowerCase()} ${username} using provider: ${normalizedTargetProvider}`);
+    const restoreSuccess = await restoreUserMFAOptions(apiKC, username, normalizedTargetProvider, mfaInfo.encryptedValue, aesKeyName);
+    if (restoreSuccess) {
+        logMain(`✅ Restored MFA options for ${userTypeLabel.toLowerCase()} ${username}`);
+    } else {
+        logError(`Failed to restore MFA options for ${userTypeLabel.toLowerCase()} ${username}`);
+    }
+}
+
+function isSuccessfulResult(result: any): boolean {
+    if (!result) return false;
+    if (result.errors) return false;
+    if (Array.isArray(result)) {
+        return result.every((item: any) => !item?.errors && (!item?.status || item.status === 'OK'));
+    }
+    if (typeof result.status === 'string' && result.status !== 'OK') {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Align target account disabled state with source using MamoriService (PUT /v1/users/:username/disable|enable).
+ * Same HTTP API applies to Mamori and directory-linked users; userType only affects logging and which list we re-query.
+ */
+async function reconcileUserDisabledState(
+    apiKC: MamoriService,
+    userType: 'mamori' | 'directory',
+    username: string,
+    sourceDisabled: boolean | null,
+    targetDisabled: boolean | null
+): Promise<void> {
+    logMain(
+        `Disabled-state check for ${userType} user ${username}: source=${sourceDisabled}, target=${targetDisabled}`
+    );
+    if (sourceDisabled === null || targetDisabled === null || sourceDisabled === targetDisabled) {
+        logMain(
+            `Disabled-state reconcile skipped for ${userType} user ${username} (no actionable difference)`
+        );
+        return;
+    }
+    const action = sourceDisabled ? 'disable' : 'enable';
+    logMain(`Reconciling ${userType} user state for ${username}: ${action} on target (SDK)`);
+    const reconcilePromise = sourceDisabled
+        ? apiKC.disable_user(username)
+        : apiKC.enable_user(username);
+    const result = await io_utils.noThrow(reconcilePromise);
+    if (isSuccessfulResult(result)) {
+        const refreshedUser = userType === 'mamori'
+            ? (await fetchMamoriUsers(apiKC)).find((u: any) => u.username === username)
+            : (await fetchDirectoryUsers(apiKC)).find((u: any) => u.username === username);
+        const refreshedDisabled = normalizeUserDisabled(refreshedUser);
+        logMain(
+            `Post-call state for ${userType} user ${username}: disabled=${refreshedDisabled}`
+        );
+        if (refreshedDisabled === sourceDisabled) {
+            logMain(`✅ Reconciled ${userType} user ${username} state to ${sourceDisabled ? 'disabled' : 'enabled'}`);
+            return;
+        }
+        logDetail(
+            `Reconcile call returned success but state mismatch remains for ${userType} user ${username}: expected=${sourceDisabled}, actual=${refreshedDisabled}`
+        );
+    } else {
+        logDetail(
+            `Disable/enable reconcile failed for ${userType} user ${username}: ${action}_user => ${JSON.stringify(result)}`
+        );
+    }
+    logError(`Failed to reconcile disabled state for ${userType} user ${username}. Source=${sourceDisabled}, Target=${targetDisabled}`);
+}
+
+function getDirectoryUserSourceKey(user: any): string {
+    const username = (user?.username || '').toLowerCase();
+    const mappedProvider = getMappedTargetProvider(user?.provider || '');
+    return `${username}::${mappedProvider}`;
+}
+
+function getDirectoryUserTargetKey(user: any): string {
+    const username = (user?.username || '').toLowerCase();
+    const targetProvider = normalizeProviderName(user?.provider || '');
+    return `${username}::${targetProvider}`;
+}
+
+async function getFilteredDatasourceNames(api: any, apiKC?: any): Promise<string[]> {
+    const names = new Set<string>();
+
+    const sourceResult = await io_utils.noThrow(io_datasource.Datasource.getAll(api));
+    const sourceItems = normalizeArrayResult(sourceResult);
+    sourceItems.forEach((ds: any) => {
+        const name = ds?.name || '';
+        if (name && shouldSyncObject('datasources', name)) {
+            names.add(name);
+        }
+    });
+
+    if (apiKC) {
+        const targetResult = await io_utils.noThrow(io_datasource.Datasource.getAll(apiKC));
+        const targetItems = normalizeArrayResult(targetResult);
+        targetItems.forEach((ds: any) => {
+            const name = ds?.name || '';
+            if (name && shouldSyncObject('datasources', name)) {
+                names.add(name);
+            }
+        });
+    }
+
+    return Array.from(names);
+}
+
+async function listDatasourceCredentialsForDatasources(
+    api: any,
+    datasourceNames: string[],
+    debugLog: boolean = false
+): Promise<any[]> {
+    let credentials: any[] = [];
+
+    for (const datasourcename of datasourceNames) {
+        const results = await io_utils.noThrow(
+            io_db_credential.DBCredential.listFor(api, 0, 1000, datasourcename, null, null)
+        );
+        const rows = normalizeArrayResult(results);
+        credentials = credentials.concat(rows);
+    }
+
+    return credentials;
 }
 
 /**
@@ -243,9 +617,10 @@ async function generateCountSummary(api: any, apiKC: any) {
         // Directory Users
         if (shouldSync('directory_users')) {
             try {
-                let payload = { skip: 0, take: 1000 };
-                let sourceCount = (await io_utils.noThrow(api.callAPI("PUT", "/v1/search/directory_users", payload))).data?.length || 0;
-                let targetCount = (await io_utils.noThrow(apiKC.callAPI("PUT", "/v1/search/directory_users", payload))).data?.length || 0;
+                const filteredSourceUsers = await fetchDirectoryUsers(api);
+                const filteredTargetUsers = await fetchDirectoryUsers(apiKC);
+                let sourceCount = filteredSourceUsers.length;
+                let targetCount = filteredTargetUsers.length;
                 let status = sourceCount === targetCount ? "✓ MATCH" : "✗ MISMATCH";
                 summaryData.push({type: "Directory Users", source: sourceCount, target: targetCount, status});
             } catch (e) {
@@ -256,8 +631,8 @@ async function generateCountSummary(api: any, apiKC: any) {
         // Mamori Users
         if (shouldSync('mamori_users')) {
             try {
-                let sourceCount = (await io_utils.noThrow(io_user.User.list(api, 0, 1000))).data?.length || 0;
-                let targetCount = (await io_utils.noThrow(io_user.User.list(apiKC, 0, 1000))).data?.length || 0;
+                let sourceCount = (await fetchMamoriUsers(api)).length;
+                let targetCount = (await fetchMamoriUsers(apiKC)).length;
                 let status = sourceCount === targetCount ? "✓ MATCH" : "✗ MISMATCH";
                 summaryData.push({type: "Mamori Users", source: sourceCount, target: targetCount, status});
             } catch (e) {
@@ -482,6 +857,49 @@ async function generateCountSummary(api: any, apiKC: any) {
             }
         }
 
+        // Datasources
+        if (shouldSync('datasources')) {
+            try {
+                let sourceResult = await io_utils.noThrow(io_datasource.Datasource.getAll(api));
+                let targetResult = await io_utils.noThrow(io_datasource.Datasource.getAll(apiKC));
+                let sourceItems = Array.isArray(sourceResult) ? sourceResult : sourceResult?.data || [];
+                let targetItems = Array.isArray(targetResult) ? targetResult : targetResult?.data || [];
+                sourceItems = Array.isArray(sourceItems)
+                    ? sourceItems.filter((ds: any) => shouldSyncObject('datasources', ds.name || ''))
+                    : [];
+                targetItems = Array.isArray(targetItems)
+                    ? targetItems.filter((ds: any) => shouldSyncObject('datasources', ds.name || ''))
+                    : [];
+                let sourceCount = sourceItems.length;
+                let targetCount = targetItems.length;
+                let status = sourceCount === targetCount ? "✓ MATCH" : "✗ MISMATCH";
+                summaryData.push({type: "Datasources", source: sourceCount, target: targetCount, status});
+            } catch (e) {
+                summaryData.push({type: "Datasources", source: -1, target: -1, status: "ERROR"});
+            }
+        }
+
+        // Datasource Credentials
+        if (shouldSync('datasource_credentials')) {
+            try {
+                const datasourceNames = await getFilteredDatasourceNames(api, apiKC);
+                let sourceItems = await listDatasourceCredentialsForDatasources(api, datasourceNames, false);
+                let targetItems = await listDatasourceCredentialsForDatasources(apiKC, datasourceNames, false);
+                sourceItems = Array.isArray(sourceItems)
+                    ? sourceItems.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred))
+                    : [];
+                targetItems = Array.isArray(targetItems)
+                    ? targetItems.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred))
+                    : [];
+                let sourceCount = sourceItems.length;
+                let targetCount = targetItems.length;
+                let status = sourceCount === targetCount ? "✓ MATCH" : "✗ MISMATCH";
+                summaryData.push({type: "Datasource Credentials", source: sourceCount, target: targetCount, status});
+            } catch (e) {
+                summaryData.push({type: "Datasource Credentials", source: -1, target: -1, status: "ERROR"});
+            }
+        }
+
         // Display the summary table
         summaryData.forEach(item => {
             const sourceStr = item.source === -1 ? "ERROR" : item.source.toString();
@@ -605,23 +1023,302 @@ async function syncProviders(api: any, apiKC: any): Promise<void> {
 }
 
 /**
- * Helper function to get user MFA provider information
+ * 5. Sync Datasources
  */
-async function getUserMFAProvider(api: any, username: string): Promise<{provider: string, hasMFA: boolean}> {
+async function syncDatasources(api: any, apiKC: any): Promise<void> {
+    if (!shouldSync('datasources')) {
+        logMain("DATASOURCES SKIPPED (disabled in config)");
+        return;
+    }
+
+    try {
+        logMain("Starting Datasources synchronization...");
+        let sourceResult = await io_utils.noThrow(io_datasource.Datasource.getAll(api));
+        let targetResult = await io_utils.noThrow(io_datasource.Datasource.getAll(apiKC));
+
+        let dataKJ = Array.isArray(sourceResult) ? sourceResult : sourceResult?.data || [];
+        let dataKC = Array.isArray(targetResult) ? targetResult : targetResult?.data || [];
+
+        let compareFunc = (s: any, t: any) => s.name === t.name;
+        let dsName = (r: any) => r.name || "";
+
+        // CREATE
+        let newItems = arrayDiff(true, dataKJ, dataKC, compareFunc);
+        newItems = limitForTest(newItems);
+        newItems = newItems.filter((ds: any) => shouldSyncObject('datasources', dsName(ds)));
+        logMain(`Found ${newItems.length} Datasources to create`);
+
+        for (let r of newItems) {
+            try {
+                let sourceDs = await io_utils.noThrow(io_datasource.Datasource.read(api, r.name));
+                if (sourceDs?.errors || !sourceDs) {
+                    let msg = sourceDs?.message || "Failed to read source datasource";
+                    logSyncAction("CREATE", "Datasource", r.name, "error", msg);
+                    continue;
+                }
+
+                let createDs = io_datasource.Datasource.build(sourceDs);
+                let res = await io_utils.noThrow(createDs.create(apiKC));
+                if (res?.errors) {
+                    logSyncAction("CREATE", "Datasource", r.name, "error", res.message || "Unknown error");
+                } else {
+                    logSyncAction("CREATE", "Datasource", r.name, "success");
+                }
+            } catch (error) {
+                logSyncAction("CREATE", "Datasource", r.name, "error", error.toString());
+            }
+        }
+
+        // UPDATE
+        let updatedItems: any[] = [];
+        for (let s of dataKJ) {
+            for (let t of dataKC) {
+                if (s.name === t.name) {
+                    let sourceDs = await io_utils.noThrow(io_datasource.Datasource.read(api, s.name));
+                    let targetDs = await io_utils.noThrow(io_datasource.Datasource.read(apiKC, s.name));
+                    if (!sourceDs?.errors && !targetDs?.errors && sourceDs && targetDs) {
+                        let sourceComparable = { ...sourceDs };
+                        let targetComparable = { ...targetDs };
+                        delete sourceComparable.id;
+                        delete targetComparable.id;
+
+                        if (JSON.stringify(sourceComparable) !== JSON.stringify(targetComparable)) {
+                            updatedItems.push(sourceDs);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        updatedItems = limitForTest(updatedItems);
+        updatedItems = updatedItems.filter((ds: any) => shouldSyncObject('datasources', dsName(ds)));
+        logMain(`Found ${updatedItems.length} Datasources to update`);
+
+        for (let r of updatedItems) {
+            try {
+                let sourceDs = await io_utils.noThrow(io_datasource.Datasource.read(api, r.name));
+                let targetDs = await io_utils.noThrow(io_datasource.Datasource.read(apiKC, r.name));
+                if (sourceDs?.errors || targetDs?.errors || !sourceDs || !targetDs) {
+                    let msg = sourceDs?.message || targetDs?.message || "Failed to read datasource for update";
+                    logSyncAction("UPDATE", "Datasource", r.name, "error", msg);
+                    continue;
+                }
+
+                let updateDs = io_datasource.Datasource.build(targetDs);
+                let res = await io_utils.noThrow(updateDs.update(apiKC, sourceDs));
+                if (res?.errors) {
+                    logSyncAction("UPDATE", "Datasource", r.name, "error", res.message || "Unknown error");
+                } else {
+                    logSyncAction("UPDATE", "Datasource", r.name, "success");
+                }
+            } catch (error) {
+                logSyncAction("UPDATE", "Datasource", r.name, "error", error.toString());
+            }
+        }
+
+        // DELETE
+        if (shouldDeleteRemoved()) {
+            let deletedItems = arrayDiff(true, dataKC, dataKJ, compareFunc);
+            deletedItems = limitForTest(deletedItems);
+            deletedItems = deletedItems.filter((ds: any) => shouldSyncObject('datasources', dsName(ds)));
+            logMain(`Found ${deletedItems.length} Datasources to delete`);
+
+            for (let r of deletedItems) {
+                try {
+                    let targetDs = await io_utils.noThrow(io_datasource.Datasource.read(apiKC, r.name));
+                    if (targetDs?.errors || !targetDs) {
+                        let msg = targetDs?.message || "Failed to read target datasource";
+                        logSyncAction("DELETE", "Datasource", r.name, "error", msg);
+                        continue;
+                    }
+
+                    let deleteDs = io_datasource.Datasource.build(targetDs);
+                    let res = await io_utils.noThrow(deleteDs.delete(apiKC));
+                    if (res?.errors) {
+                        logSyncAction("DELETE", "Datasource", r.name, "error", res.message || "Unknown error");
+                    } else {
+                        logSyncAction("DELETE", "Datasource", r.name, "success");
+                    }
+                } catch (error) {
+                    logSyncAction("DELETE", "Datasource", r.name, "error", error.toString());
+                }
+            }
+        } else {
+            logMain("Datasource deletion skipped (delete_removed disabled in config)");
+        }
+    } catch (error) {
+        logError(`Datasources sync failed: ${error}`);
+    } finally {
+        logMain("DATASOURCES DONE");
+    }
+}
+
+/**
+ * 6. Sync Datasource Credentials
+ */
+async function syncDatasourceCredentials(api: any, apiKC: any, aesKeyName: string): Promise<void> {
+    if (!shouldSync('datasource_credentials')) {
+        logMain("DATASOURCE CREDENTIALS SKIPPED (disabled in config)");
+        return;
+    }
+
+    if (!aesKeyName) {
+        logError("DATASOURCE CREDENTIALS SKIPPED - AES key is required for export/restore");
+        return;
+    }
+
+    const credentialKey = (c: any) => `${c.systemname || c.datasource}|${c.accessname}|${c.grantee}`;
+
+    try {
+        logMain("Starting Datasource Credentials synchronization...");
+        const datasourceNames = await getFilteredDatasourceNames(api, apiKC);
+        let dataKJ = await listDatasourceCredentialsForDatasources(api, datasourceNames, true);
+        let dataKC = await listDatasourceCredentialsForDatasources(apiKC, datasourceNames, false);
+        dataKJ = dataKJ.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
+        dataKC = dataKC.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
+        let compareFunc = (s: any, t: any) => credentialKey(s) === credentialKey(t);
+
+        // CREATE
+        let newItems = arrayDiff(true, dataKJ, dataKC, compareFunc);
+        newItems = limitForTest(newItems);
+        newItems = newItems.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
+        logMain(`Found ${newItems.length} Datasource Credentials to create`);
+
+        for (let r of newItems) {
+            try {
+                let sourceCred = io_db_credential.DBCredential.build(r);
+                let exportedPassword = await io_utils.noThrow(sourceCred.exportPassword(api, aesKeyName));
+                if (!exportedPassword || exportedPassword?.errors) {
+                    let msg = exportedPassword?.message || "Failed to export source credential password";
+                    logSyncAction("CREATE", "Datasource Credential", credentialKey(r), "error", msg);
+                    continue;
+                }
+
+                sourceCred.password = exportedPassword;
+                let res = await io_utils.noThrow(sourceCred.restore(apiKC, aesKeyName));
+                if (res?.errors) {
+                    logSyncAction("CREATE", "Datasource Credential", credentialKey(r), "error", res.message || "Unknown error");
+                } else {
+                    logSyncAction("CREATE", "Datasource Credential", credentialKey(r), "success");
+                }
+            } catch (error) {
+                logSyncAction("CREATE", "Datasource Credential", credentialKey(r), "error", error.toString());
+            }
+        }
+
+        // UPDATE
+        let updatedItems: any[] = [];
+        for (let s of dataKJ) {
+            for (let t of dataKC) {
+                if (compareFunc(s, t)) {
+                    let sourceCred = io_db_credential.DBCredential.build(s);
+                    let targetCred = io_db_credential.DBCredential.build(t);
+                    let sourceEncrypted = await io_utils.noThrow(sourceCred.exportPassword(api, aesKeyName));
+                    let targetEncrypted = await io_utils.noThrow(targetCred.exportPassword(apiKC, aesKeyName));
+
+                    if (!sourceEncrypted || sourceEncrypted?.errors) {
+                        break;
+                    }
+
+                    if (sourceEncrypted !== targetEncrypted ||
+                        (sourceCred.credential_reset_days || "") !== (targetCred.credential_reset_days || "")) {
+                        updatedItems.push(s);
+                    }
+                    break;
+                }
+            }
+        }
+
+        updatedItems = limitForTest(updatedItems);
+        updatedItems = updatedItems.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
+        logMain(`Found ${updatedItems.length} Datasource Credentials to update`);
+
+        for (let r of updatedItems) {
+            try {
+                let sourceCred = io_db_credential.DBCredential.build(r);
+                let exportedPassword = await io_utils.noThrow(sourceCred.exportPassword(api, aesKeyName));
+                if (!exportedPassword || exportedPassword?.errors) {
+                    let msg = exportedPassword?.message || "Failed to export source credential password";
+                    logSyncAction("UPDATE", "Datasource Credential", credentialKey(r), "error", msg);
+                    continue;
+                }
+
+                sourceCred.password = exportedPassword;
+                let res = await io_utils.noThrow(sourceCred.restore(apiKC, aesKeyName));
+                if (res?.errors) {
+                    logSyncAction("UPDATE", "Datasource Credential", credentialKey(r), "error", res.message || "Unknown error");
+                } else {
+                    logSyncAction("UPDATE", "Datasource Credential", credentialKey(r), "success");
+                }
+            } catch (error) {
+                logSyncAction("UPDATE", "Datasource Credential", credentialKey(r), "error", error.toString());
+            }
+        }
+
+        // DELETE
+        if (shouldDeleteRemoved()) {
+            let deletedItems = arrayDiff(true, dataKC, dataKJ, compareFunc);
+            deletedItems = limitForTest(deletedItems);
+            deletedItems = deletedItems.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
+            logMain(`Found ${deletedItems.length} Datasource Credentials to delete`);
+
+            for (let r of deletedItems) {
+                try {
+                    let deleteCred = io_db_credential.DBCredential.build(r);
+                    let res = await io_utils.noThrow(deleteCred.delete(apiKC));
+                    if (res?.errors) {
+                        logSyncAction("DELETE", "Datasource Credential", credentialKey(r), "error", res.message || "Unknown error");
+                    } else {
+                        logSyncAction("DELETE", "Datasource Credential", credentialKey(r), "success");
+                    }
+                } catch (error) {
+                    logSyncAction("DELETE", "Datasource Credential", credentialKey(r), "error", error.toString());
+                }
+            }
+        } else {
+            logMain("Datasource Credential deletion skipped (delete_removed disabled in config)");
+        }
+    } catch (error) {
+        logError(`Datasource Credentials sync failed: ${error}`);
+    } finally {
+        logMain("DATASOURCE CREDENTIALS DONE");
+    }
+}
+
+/**
+ * Resolve MFA provider for export using:
+ * 1) SYS.USER_OPTIONS rows (option_name → provider, e.g. secret_mobile_identifier → pushmobile)
+ * 2) Tab-separated `providers` from the source user search row when options are empty or ambiguous
+ */
+async function getUserMFAProvider(
+    api: any,
+    username: string,
+    providersHintTab?: string,
+): Promise<{ provider: string; hasMFA: boolean }> {
     try {
         const userOptions = await io_utils.noThrow(api.user_options(username));
-        if (userOptions.errors || !userOptions.data) {
-            return { provider: 'none', hasMFA: false };
+        if (userOptions.errors) {
+            return { provider: "none", hasMFA: false };
         }
-        
-        const authProvider = userOptions.data.authenticated_by_primary;
-        if (authProvider && authProvider.provider && authProvider.provider !== 'none' && authProvider.provider !== 'password') {
-            return { provider: authProvider.provider, hasMFA: true };
+
+        const rows = extractUserOptionsRows(userOptions);
+        const fromRows = inferMfaFromUserOptionRows(rows, providersHintTab || "");
+        if (fromRows.hasMFA) {
+            return fromRows;
         }
-        return { provider: 'none', hasMFA: false };
+
+        if (providersHintTab) {
+            const fromHint = inferMfaProviderFromProvidersTabString(providersHintTab);
+            if (fromHint.hasMFA) {
+                return fromHint;
+            }
+        }
+
+        return { provider: "none", hasMFA: false };
     } catch (error) {
         logDetail(`Failed to get MFA provider for user ${username}: ${error}`);
-        return { provider: 'none', hasMFA: false };
+        return { provider: "none", hasMFA: false };
     }
 }
 
@@ -630,9 +1327,15 @@ async function getUserMFAProvider(api: any, username: string): Promise<{provider
  */
 async function exportUserMFAOptions(api: any, username: string, provider: string, aesKeyName: string): Promise<string | null> {
     try {
+        // #region agent log
+        fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H8',location:'scripts/sync-config.ts:exportUserMFAOptions:start',message:'Attempting MFA export',data:{username,provider},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
         const exportResult = await io_utils.noThrow(api.call("EXPORT_USER_AUTH_PROVIDER_OPTIONS_EX", username, provider, aesKeyName));
         if (exportResult.errors || !Array.isArray(exportResult) || exportResult.length === 0) {
             logError(`Failed to export MFA options for user ${username}: ${exportResult.message || 'Unknown error'}`);
+            // #region agent log
+            fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H8',location:'scripts/sync-config.ts:exportUserMFAOptions:error',message:'MFA export failed',data:{username,provider,exportResult},timestamp:Date.now()})}).catch(()=>{});
+            // #endregion
             return null;
         }
         
@@ -641,6 +1344,9 @@ async function exportUserMFAOptions(api: any, username: string, provider: string
             logError(`Export result missing value for user ${username}`);
             return null;
         }
+        // #region agent log
+        fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H8',location:'scripts/sync-config.ts:exportUserMFAOptions:success',message:'MFA export succeeded',data:{username,provider,hasEncryptedValue:!!exportedData.value},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
         
         return exportedData.value;
     } catch (error) {
@@ -681,11 +1387,12 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
         return;
     }
 
+    let tempAESKey: any = null;
+
     try {
         logMain("Starting Mamori users synchronization...");
         
         // Create temporary AES key for MFA options export/restore
-        let tempAESKey: any = null;
         try {
             tempAESKey = await createTemporaryAESKey(api, apiKC);
             logMain(`✅ Created temporary AES key for MFA sync: ${tempAESKey.keyName}`);
@@ -694,20 +1401,14 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
             logMain("⚠️ Continuing without MFA sync (users will be synced without MFA options)");
         }
         
-        let dataKJ = (await io_utils.noThrow(io_user.User.list(api, 0, 1000))).data;
-        let dataKC = (await io_utils.noThrow(io_user.User.list(apiKC, 0, 1000))).data;
+        let dataKJ = await fetchMamoriUsers(api);
+        let dataKC = await fetchMamoriUsers(apiKC);
         
-        let compareFunc = (s: any, t: any) => {
-            // Normalize fields for comparison
-            let sEmail = s.email || '';
-            let tEmail = t.email || '';
-            let sFullname = s.fullname || '';
-            let tFullname = t.fullname || '';
-            return s.username === t.username && sEmail === tEmail && sFullname === tFullname;
-        };
+        const targetByUsername = new Map<string, any>(dataKC.map((u: any) => [u.username, u]));
+        const sourceByUsername = new Map<string, any>(dataKJ.map((u: any) => [u.username, u]));
         
         // Create new users
-        let newItems = arrayDiff(true, dataKJ, dataKC, compareFunc);
+        let newItems = dataKJ.filter((user: any) => !targetByUsername.has(user.username));
         newItems = limitForTest(newItems);
         newItems = newItems.filter((user: any) => shouldSyncObject('mamori_users', user.username));
         
@@ -717,18 +1418,13 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 logMain(`Creating Mamori user: ${r.username}`);
                 
                 // Check if user has MFA and export options if available
-                let mfaInfo = { provider: 'none', hasMFA: false, encryptedValue: null as string | null };
+                let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
                 if (tempAESKey) {
-                    let mfaInfo = await getUserMFAProvider(api, r.username);
+                    mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r);
                     if (mfaInfo.hasMFA) {
                         logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
-                        const encryptedValue = await exportUserMFAOptions(api, r.username, mfaInfo.provider, tempAESKey.keyName);
-                        if (encryptedValue) {
-                            mfaInfo.encryptedValue = encryptedValue;
-                            logDetail(`Exported MFA options for user ${r.username}`);
-                        } else {
-                            logError(`Failed to export MFA options for user ${r.username}, continuing without MFA`);
-                        }
+                        if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for user ${r.username}`);
+                        else logError(`Failed to export MFA options for user ${r.username}, continuing without MFA`);
                     }
                 }
                 
@@ -744,15 +1440,15 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                     logMain(`✅ Created Mamori user: ${r.username}`);
                     
                     // Restore MFA options if available
-                    if (tempAESKey && mfaInfo.hasMFA && mfaInfo.encryptedValue) {
-                        logDetail(`Restoring MFA options for user ${r.username}`);
-                        const restoreSuccess = await restoreUserMFAOptions(apiKC, r.username, mfaInfo.provider, mfaInfo.encryptedValue, tempAESKey.keyName);
-                        if (restoreSuccess) {
-                            logMain(`✅ Restored MFA options for user ${r.username}`);
-                        } else {
-                            logError(`Failed to restore MFA options for user ${r.username}`);
-                        }
+                    if (tempAESKey) {
+                        await restoreUserMFAIfAvailable(apiKC, r.username, mfaInfo.provider, tempAESKey.keyName, mfaInfo, "Mamori User");
                     }
+                    const sourceDisabled = normalizeUserDisabled(r);
+                    const createdTarget = (await fetchMamoriUsers(apiKC)).find((u: any) => u.username === r.username) || null;
+                    logMain(
+                        `Post-create disabled reconcile inputs for ${r.username}: source=${sourceDisabled}, target=${normalizeUserDisabled(createdTarget)}`
+                    );
+                    await reconcileUserDisabledState(apiKC, 'mamori', r.username, sourceDisabled, normalizeUserDisabled(createdTarget));
                 }
             } catch (error) {
                 logSyncAction("CREATE", "Mamori User", r.username, "error", error.toString());
@@ -763,18 +1459,48 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
         // Update existing users
         let updatedItems: any[] = [];
         for (let s of dataKJ) {
-            for (let t of dataKC) {
-                if (s.username === t.username && shouldSyncObject('mamori_users', s.username)) {
-                    // Normalize fields for comparison
-                    let sEmail = s.email || '';
-                    let tEmail = t.email || '';
-                    let sFullname = s.fullname || '';
-                    let tFullname = t.fullname || '';
-                    if (sEmail !== tEmail || sFullname !== tFullname) {
-                        updatedItems.push(s);
-                    }
-                    break;
-                }
+            const t = targetByUsername.get(s.username);
+            if (!t || !shouldSyncObject('mamori_users', s.username)) continue;
+            let sEmail = s.email || '';
+            let tEmail = t.email || '';
+            let sFullname = s.fullname || '';
+            let tFullname = t.fullname || '';
+            const sDisabled = normalizeUserDisabled(s);
+            const tDisabled = normalizeUserDisabled(t);
+            const sProviders = normalizeUserProvidersString(s);
+            const tProviders = normalizeUserProvidersString(t);
+            const providersChanged = sProviders !== tProviders;
+            // #region agent log
+            fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H1',location:'scripts/sync-config.ts:mamori-compare-loop',message:'Mamori user source/target raw comparison snapshot',data:{username:s.username,sourceRaw:s,targetRaw:t,normalized:{sourceDisabled:sDisabled,targetDisabled:tDisabled,sourceProviders:sProviders,targetProviders:tProviders}},timestamp:Date.now()})}).catch(()=>{});
+            // #endregion
+            //console.log("AI DEBUG MAMORI COMPARE SOURCE RAW %o", s);
+            //console.log("AI DEBUG MAMORI COMPARE TARGET RAW %o", t);
+            //console.log("AI DEBUG MAMORI COMPARE NORMALIZED", {
+            //    username: s.username,
+            //    sourceDisabled: sDisabled,
+            //    targetDisabled: tDisabled,
+            //    sourceProviders: sProviders,
+            //    targetProviders: tProviders
+            //});
+            if (sEmail !== tEmail || sFullname !== tFullname || (sDisabled !== null && tDisabled !== null && sDisabled !== tDisabled) || providersChanged) {
+                logMain(
+                    `Detected Mamori user difference for ${s.username}: emailChanged=${sEmail !== tEmail}, fullnameChanged=${sFullname !== tFullname}, disabledChanged=${sDisabled !== null && tDisabled !== null && sDisabled !== tDisabled}, providersChanged=${providersChanged}`
+                );
+                // #region agent log
+                fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H2',location:'scripts/sync-config.ts:mamori-compare-diff',message:'Mamori user marked for update due to field differences',data:{username:s.username,diff:{emailChanged:sEmail!==tEmail,fullnameChanged:sFullname!==tFullname,disabledChanged:(sDisabled!==null&&tDisabled!==null&&sDisabled!==tDisabled),providersChanged},sourceValues:{email:sEmail,fullname:sFullname,disabled:sDisabled,providers:sProviders},targetValues:{email:tEmail,fullname:tFullname,disabled:tDisabled,providers:tProviders}},timestamp:Date.now()})}).catch(()=>{});
+                // #endregion
+                console.log("AI DEBUG MAMORI DIFF DETECTED", {
+                    username: s.username,
+                    diff: {
+                        emailChanged: sEmail !== tEmail,
+                        fullnameChanged: sFullname !== tFullname,
+                        disabledChanged: (sDisabled !== null && tDisabled !== null && sDisabled !== tDisabled),
+                        providersChanged
+                    },
+                    sourceValues: { email: sEmail, fullname: sFullname, disabled: sDisabled, providers: sProviders },
+                    targetValues: { email: tEmail, fullname: tFullname, disabled: tDisabled, providers: tProviders }
+                });
+                updatedItems.push(s);
             }
         }
         
@@ -783,18 +1509,13 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 logMain(`Updating Mamori user: ${r.username}`);
                 
                 // Check if user has MFA and export options if available
-                let mfaInfo = { provider: 'none', hasMFA: false, encryptedValue: null as string | null };
+                let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
                 if (tempAESKey) {
-                    mfaInfo = await getUserMFAProvider(api, r.username);
+                    mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r);
                     if (mfaInfo.hasMFA) {
                         logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
-                        const encryptedValue = await exportUserMFAOptions(api, r.username, mfaInfo.provider, tempAESKey.keyName);
-                        if (encryptedValue) {
-                            mfaInfo.encryptedValue = encryptedValue;
-                            logDetail(`Exported MFA options for user ${r.username}`);
-                        } else {
-                            logError(`Failed to export MFA options for user ${r.username}, continuing without MFA`);
-                        }
+                        if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for user ${r.username}`);
+                        else logError(`Failed to export MFA options for user ${r.username}, continuing without MFA`);
                     }
                 }
                 
@@ -810,15 +1531,20 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                     logMain(`✅ Updated Mamori user: ${r.username}`);
                     
                     // Restore MFA options if available
-                    if (tempAESKey && mfaInfo.hasMFA && mfaInfo.encryptedValue) {
-                        logDetail(`Restoring MFA options for user ${r.username}`);
-                        const restoreSuccess = await restoreUserMFAOptions(apiKC, r.username, mfaInfo.provider, mfaInfo.encryptedValue, tempAESKey.keyName);
-                        if (restoreSuccess) {
-                            logMain(`✅ Restored MFA options for user ${r.username}`);
-                        } else {
-                            logError(`Failed to restore MFA options for user ${r.username}`);
-                        }
+                    if (tempAESKey) {
+                        await restoreUserMFAIfAvailable(apiKC, r.username, mfaInfo.provider, tempAESKey.keyName, mfaInfo, "Mamori User");
                     }
+                    const refreshedTarget = (await fetchMamoriUsers(apiKC)).find((u: any) => u.username === r.username) || null;
+                    const sourceDisabled = normalizeUserDisabled(r);
+                    const targetDisabled = normalizeUserDisabled(refreshedTarget);
+                    logMain(
+                        `Post-update disabled reconcile inputs for ${r.username}: source=${sourceDisabled}, target=${targetDisabled}`
+                    );
+                    await reconcileUserDisabledState(apiKC, 'mamori', r.username, sourceDisabled, targetDisabled);
+                    const afterReconcile = (await fetchMamoriUsers(apiKC)).find((u: any) => u.username === r.username) || null;
+                    logMain(
+                        `Post-update target state for ${r.username}: disabled=${normalizeUserDisabled(afterReconcile)}`
+                    );
                 }
             } catch (error) {
                 logSyncAction("UPDATE", "Mamori User", r.username, "error", error.toString());
@@ -828,7 +1554,7 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
         
         // Delete users that exist on target but not on source
         if (shouldDeleteRemoved()) {
-            let deletedItems = arrayDiff(true, dataKC, dataKJ, compareFunc);
+            let deletedItems = dataKC.filter((user: any) => !sourceByUsername.has(user.username));
             deletedItems = limitForTest(deletedItems);
             deletedItems = deletedItems.filter((user: any) => 
                 shouldSyncObject('mamori_users', user.username) &&
@@ -882,13 +1608,22 @@ async function syncDirectoryUsers(api: any, apiKC: any, syncedProviders: string[
         return;
     }
 
+    let tempAESKey: any = null;
+
     try {
         logMain("Starting directory users synchronization...");
-        let payload = { skip: 0, take: 1000 };
-        let dataKJ = (await io_utils.noThrow(api.callAPI("PUT", "/v1/search/directory_users", payload))).data;
-        let dataKC = (await io_utils.noThrow(apiKC.callAPI("PUT", "/v1/search/directory_users", payload))).data;
         
-        let compareFunc = (s: any, t: any) => s.username === t.username;
+        // Create temporary AES key for MFA options export/restore
+        try {
+            tempAESKey = await createTemporaryAESKey(api, apiKC);
+            logMain(`✅ Created temporary AES key for directory user MFA sync: ${tempAESKey.keyName}`);
+        } catch (error) {
+            logError(`Failed to create temporary AES key for directory user MFA sync: ${error}`);
+            logMain("⚠️ Continuing without directory user MFA sync (users will be synced without MFA options)");
+        }
+        
+        let dataKJ = await fetchDirectoryUsers(api);
+        let dataKC = await fetchDirectoryUsers(apiKC);
         
         // Filter directory users based on successfully synced providers
         let shouldSyncDirectoryUser = (userProvider: string): boolean => {
@@ -896,41 +1631,107 @@ async function syncDirectoryUsers(api: any, apiKC: any, syncedProviders: string[
             return syncedProviders.includes(userProvider);
         };
         
-        // Create new users
-        let newItems = arrayDiff(true, dataKJ, dataKC, compareFunc);
-        newItems = limitForTest(newItems);
-        newItems = newItems.filter((user: any) => 
+        const filteredSourceUsers = dataKJ.filter((user: any) =>
             shouldSyncObject('directory_users', user.username) && 
             shouldSyncDirectoryUser(user.provider)
         );
-        
+        const sourceByKey = new Map<string, any>(filteredSourceUsers.map((user: any) => [getDirectoryUserSourceKey(user), user]));
+        const targetByKey = new Map<string, any>(
+            dataKC
+                .filter((user: any) => shouldSyncObject('directory_users', user.username))
+                .map((user: any) => [getDirectoryUserTargetKey(user), user])
+        );
+        let newItems = Array.from(sourceByKey.entries())
+            .filter(([key]) => !targetByKey.has(key))
+            .map(([, user]) => user);
+        newItems = limitForTest(newItems);
+
+        const existingPairs = Array.from(sourceByKey.entries())
+            .filter(([key]) => targetByKey.has(key))
+            .map(([key, sourceUser]) => ({ sourceUser, targetUser: targetByKey.get(key) }));
+
+        logMain(`Directory user matching summary: NEW=${newItems.length}, EXISTING=${existingPairs.length}`);
         logMain(`Found ${newItems.length} new directory users to create`);
         for (let r of newItems) {
             try {
                 logMain(`Creating directory user: ${r.username}`);
-                let res = await io_utils.noThrow(apiKC.callAPI("POST", "/v1/directory_users", {
+                const mappedTargetProvider = getMappedTargetProvider(r.provider || '');
+                
+                // Check if user has MFA and export options if available
+                let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
+                if (tempAESKey) {
+                    mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r);
+                    if (mfaInfo.hasMFA) {
+                        logDetail(`Directory user ${r.username} has MFA provider: ${mfaInfo.provider}`);
+                        if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for directory user ${r.username}`);
+                        else logError(`Failed to export MFA options for directory user ${r.username}, continuing without MFA`);
+                    }
+                }
+                
+                let payload = {
                     username: r.username,
                     email: r.email || '',
                     fullname: r.fullname || '',
-                    provider: r.provider
-                }));
+                    provider: mappedTargetProvider
+                };
+                let res = await io_utils.noThrow(apiKC.callAPI("POST", "/v1/directory_users", payload));
                 if (res.errors) {
                     logSyncAction("CREATE", "Directory User", r.username, "error", res.message || "Unknown error");
                     logError(`Failed to create directory user ${r.username}: ${res.message}`);
                 } else {
                     logSyncAction("CREATE", "Directory User", r.username, "success");
                     logMain(`✅ Created directory user: ${r.username}`);
+                    
+                    // Restore MFA options if available
+                    if (tempAESKey) {
+                        await restoreUserMFAIfAvailable(apiKC, r.username, mappedTargetProvider, tempAESKey.keyName, mfaInfo, "Directory User");
+                    }
+                    const createdTarget = (await fetchDirectoryUsers(apiKC)).find((u: any) =>
+                        u.username === r.username && normalizeProviderName(u.provider || '') === normalizeProviderName(mappedTargetProvider)
+                    ) || null;
+                    logMain(
+                        `Post-create directory disabled reconcile inputs for ${r.username}: source=${normalizeUserDisabled(r)}, target=${normalizeUserDisabled(createdTarget)}`
+                    );
+                    await reconcileUserDisabledState(apiKC, 'directory', r.username, normalizeUserDisabled(r), normalizeUserDisabled(createdTarget));
                 }
             } catch (error) {
                 logSyncAction("CREATE", "Directory User", r.username, "error", error.toString());
                 logError(`Failed to create directory user ${r.username}: ${error}`);
             }
         }
+
+        for (const pair of existingPairs) {
+            const sourceUser = pair.sourceUser;
+            const targetUser = pair.targetUser;
+            logMain(
+                `Existing directory user compare for ${sourceUser.username}: sourceDisabled=${normalizeUserDisabled(sourceUser)}, targetDisabled=${normalizeUserDisabled(targetUser)}`
+            );
+            await reconcileUserDisabledState(
+                apiKC,
+                'directory',
+                sourceUser.username,
+                normalizeUserDisabled(sourceUser),
+                normalizeUserDisabled(targetUser)
+            );
+
+            if (tempAESKey) {
+                const mappedTargetProvider = getMappedTargetProvider(sourceUser.provider || '');
+                let mfaInfo: ExportedMFAInfo = await exportUserMFAIfPresent(api, sourceUser.username, tempAESKey.keyName, sourceUser);
+                if (mfaInfo.hasMFA) {
+                    logDetail(`Directory user ${sourceUser.username} has MFA provider: ${mfaInfo.provider}`);
+                    if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for directory user ${sourceUser.username}`);
+                    else logError(`Failed to export MFA options for directory user ${sourceUser.username}, continuing without MFA`);
+                }
+                await restoreUserMFAIfAvailable(apiKC, sourceUser.username, mappedTargetProvider, tempAESKey.keyName, mfaInfo, "Directory User");
+            }
+        }
         
         // Delete directory users that exist on target but not on source
         if (shouldDeleteRemoved()) {
-            let deletedItems = arrayDiff(true, dataKC, dataKJ, compareFunc);
-        deletedItems = limitForTest(deletedItems);
+            let deletedItems = Array.from(targetByKey.entries())
+                .filter(([key]) => !sourceByKey.has(key))
+                .map(([, user]) => user);
+            deletedItems = limitForTest(deletedItems);
             deletedItems = deletedItems.filter((user: any) => 
                 shouldSyncObject('directory_users', user.username) &&
                 user.username !== mamoriKCUser // Protect the sync user from deletion
@@ -960,6 +1761,15 @@ async function syncDirectoryUsers(api: any, apiKC: any, syncedProviders: string[
     } catch (error) {
         logError(`Directory users sync failed: ${error}`);
     } finally {
+        // Clean up temporary AES key used for directory user MFA sync
+        if (tempAESKey) {
+            try {
+                await tempAESKey.cleanup();
+                logMain(`✅ Cleaned up temporary AES key for directory user MFA sync: ${tempAESKey.keyName}`);
+            } catch (error) {
+                logError(`Failed to cleanup temporary AES key for directory user MFA sync: ${error}`);
+            }
+        }
         logMain("DIRECTORY USERS DONE");
         }
 }
@@ -2617,6 +3427,35 @@ async function extractQueries() {
     let tempAESKey: TempAESKey | null = null;
 
     try {
+        const formatApiVersion = (versionResult: any): string => {
+            if (versionResult == null) return "unknown";
+            if (typeof versionResult === 'string' || typeof versionResult === 'number') {
+                return String(versionResult);
+            }
+            if (typeof versionResult === 'object') {
+                if (versionResult.version) return String(versionResult.version);
+                if (versionResult.data?.version) return String(versionResult.data.version);
+                if (versionResult.data) return JSON.stringify(versionResult.data);
+                return JSON.stringify(versionResult);
+            }
+            return String(versionResult);
+        };
+
+        // Print API versions before attempting source/target logins
+        try {
+            const sourceApiVersion = await (api as any).api_version();
+            logMain(`Source API version: ${formatApiVersion(sourceApiVersion)}`);
+        } catch (versionError) {
+            logError(`Failed to fetch source API version: ${versionError}`);
+        }
+
+        try {
+            const targetApiVersion = await (apiKC as any).api_version();
+            logMain(`Target API version: ${formatApiVersion(targetApiVersion)}`);
+        } catch (versionError) {
+            logError(`Failed to fetch target API version: ${versionError}`);
+        }
+
         logMain(`Connecting to ${mamoriUrl}...`);
         let login = await api.login(mamoriUser, mamoriPwd);
         logMain(`Login successful for: ${login.fullname}, session: ${login.session_id}`);
@@ -2625,9 +3464,9 @@ async function extractQueries() {
         let loginkc = await apiKC.login(mamoriKCUser, mamoriKCPwd);
         logMain(`Login successful for: ${loginkc.fullname}, session: ${loginkc.session_id}`);
 
-                // Create temporary AES key for secrets and encryption keys synchronization
-                if (shouldSync('secrets') || shouldSync('encryption_keys')) {
-                    logMain("🔐 Creating temporary AES key for secrets and encryption keys synchronization...");
+                // Create temporary AES key for encrypted export/restore synchronization
+                if (shouldSync('secrets') || shouldSync('encryption_keys') || shouldSync('datasource_credentials')) {
+                    logMain("🔐 Creating temporary AES key for encrypted export/restore synchronization...");
                     tempAESKey = await createTemporaryAESKey(api, apiKC);
                     logMain(`✅ Temporary AES key created: ${tempAESKey.keyId}`);
                     // Set the temporary key name for the rest of the sync
@@ -2650,6 +3489,8 @@ async function extractQueries() {
     }
     logMain(`  - Secrets: ${syncConfig.sync_objects?.secrets ? "ENABLED" : "DISABLED"}`);
     logMain(`  - Encryption Keys: ${syncConfig.sync_objects?.encryption_keys ? "ENABLED" : "DISABLED"}`);
+    logMain(`  - Datasources: ${syncConfig.sync_objects?.datasources ? "ENABLED" : "DISABLED"}`);
+    logMain(`  - Datasource Credentials: ${syncConfig.sync_objects?.datasource_credentials ? "ENABLED" : "DISABLED"}`);
     logMain(`  - Providers: ${syncConfig.sync_objects?.providers ? "ENABLED" : "DISABLED"}`);
     logMain(`  - Directory Users: ${syncConfig.sync_objects?.directory_users ? "ENABLED" : "DISABLED"}`);
     logMain(`  - Mamori Users: ${syncConfig.sync_objects?.mamori_users ? "ENABLED" : "DISABLED"}`);
@@ -2669,7 +3510,7 @@ async function extractQueries() {
 
     if (!isReportMode()) {
     // ========================================
-    // SYNC ORDER: 0. Providers -> 1. Mamori Users -> 2. Directory Users -> 3. Role Definitions -> 4. Role Grants -> 5. Resources -> 6. Direct Permissions
+    // SYNC ORDER: 0. Providers -> 1. Mamori Users -> 2. Directory Users -> 3. Role Definitions -> 4. Role Grants -> 5. Datasources -> 6. Datasource Credentials -> 7. Resources -> 8. Direct Permissions
     // ========================================
 
     // Track successfully synced providers for directory user filtering
@@ -2690,10 +3531,16 @@ async function extractQueries() {
     // 4. ROLE GRANTS (ALL grants - both user and role grantees)
     await syncRoleGrants(api, apiKC);
 
-    // 5. RESOURCES (Secrets, SSH Logins, etc.)
+    // 5. DATASOURCES
+    await syncDatasources(api, apiKC);
+
+    // 6. DATASOURCE CREDENTIALS
+    await syncDatasourceCredentials(api, apiKC, process.env.MAMORI_AES_KEY || '');
+
+    // 7. RESOURCES (Secrets, SSH Logins, etc.)
     await syncResources(api, apiKC, process.env.MAMORI_AES_KEY || '');
 
-    // 6. DIRECT PERMISSIONS (ALL permission types for both users and roles)
+    // 8. DIRECT PERMISSIONS (ALL permission types for both users and roles)
     await syncDirectPermissions(api, apiKC);
 
     } // End of sync operations (skip in report mode)

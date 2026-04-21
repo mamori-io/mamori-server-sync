@@ -31,6 +31,16 @@
     "test_mode": false,
     "test_limit": 1000
   },
+  "provider_mappings": [
+    {
+      "source_provider": "ad_sandbox",
+      "target_provider": "demo_ad"
+    },
+    {
+      "source_provider": "corp_ldap",
+      "target_provider": "corp_ldap_dr"
+    }
+  ],
   "object_filters": {
     "description": "Filter specific objects by name patterns. Use regex patterns or exact names. Leave empty to sync all objects.",
     "providers": [

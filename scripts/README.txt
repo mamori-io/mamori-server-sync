@@ -37,8 +37,6 @@ export MAMORI_PASSWORD2="your-password"
 
 **Optional Variables:**
 ```bash
-export MAMORI_AD_PROVIDER="your-ad-provider"
-export MAMORI_AD_PROVIDER2="your-ad-provider"
 export REPORT_MODE="true"  # For count-only mode
 ```
 
@@ -172,12 +170,14 @@ SYNC MODES
 - Applies object filters
 - Performs create, update, and delete operations
 - Generates comprehensive count summary
+- Copies MFA options for Mamori users and directory users when available (best-effort)
 
 ## Test Mode
 - Uses `sync-config-test.json`
 - Limits operations to 1 item each
 - Safe for validation and testing
 - Quick verification of sync logic
+- MFA copy is still attempted for synced users, with failures logged but non-blocking
 
 ## Report Mode
 - Only generates count summary

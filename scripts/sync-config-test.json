@@ -13,9 +13,11 @@
     "remote_desktop_logins": 0,
     "http_resources": 0,
     "secrets": 0,
+    "datasources": 1,
+    "datasource_credentials": 1,
     "ssh_logins": 0,
     "requestable_resources": 0,
-    "roles": 1,
+    "roles": 0,
     "role_grants": 0,
     "role_permissions": 0,
     "on_demand_policies": 0
@@ -27,6 +29,25 @@
     "batch_size": 1000,
     "log_level": "info",
     "test_mode": true,
-    "test_limit": 1
+    "test_limit": 3
+  },
+  "provider_mappings": [
+    {
+      "source_provider": "ad_sandbox",
+      "target_provider": "demo_ad"
+    }
+  ],
+  "object_filters": {
+    "mamori_users": [
+      "^om01$",
+      "^om02$",
+      "^om03$"
+    ],
+    "directory_users": [
+      "^omasri$"
+    ],
+    "datasources": [
+      "^oracle193$"
+    ]
   }
 }

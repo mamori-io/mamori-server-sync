@@ -35,13 +35,6 @@ The sync script now **automatically creates and manages AES encryption keys** fo
 
 ## Optional Variables
 
-### Active Directory Providers
-```bash
-export MAMORI_AD_PROVIDER="your_ad_provider_name"
-export MAMORI_AD_PROVIDER2="your_ad_provider_name"
-```
-Used for directory user synchronization. Leave empty if not using Active Directory.
-
 ### Output Directory
 ```bash
 export MAMORI_OUTPUT_DIRECTORY="/app/sync"
@@ -64,7 +57,6 @@ When set to "true", only generates count summary without performing actual sync 
 | `MAMORI_SERVER2` | ✅ | URL of target Mamori server | `https://target.mamori.io` |
 | `MAMORI_USERNAME2` | ✅ | Username for target server | `admin` |
 | `MAMORI_PASSWORD2` | ✅ | Password for target server | `your_password` |
-| `MAMORI_AD_PROVIDER2` | ❌ | AD provider name (target) | `company-ad` |
 | `MAMORI_OUTPUT_DIRECTORY` | ❌ | Output directory for config files | `/app/sync` |
 | `REPORT_MODE` | ❌ | Enable report-only mode | `true` |
 
@@ -92,10 +84,6 @@ export MAMORI_PASSWORD2="secure_password_123"
 
 # AES encryption keys are now managed automatically - no configuration needed!
 
-# Active Directory (if using)
-export MAMORI_AD_PROVIDER="company-active-directory"
-export MAMORI_AD_PROVIDER2="company-active-directory"
-
 # Output directory
 export MAMORI_OUTPUT_DIRECTORY="/app/sync"
 ```
@@ -107,7 +95,7 @@ export MAMORI_OUTPUT_DIRECTORY="/app/sync"
 1. **Secrets not syncing**: Check that the sync user has permissions to create/delete AES keys
 2. **Connection failures**: Check server URLs, usernames, and passwords
 3. **Permission errors**: Ensure sync user has admin privileges
-4. **AD sync issues**: Verify AD provider names are correct
+4. **Directory user sync issues**: Verify `provider_mappings` in sync config
 
 ### Testing Connection
 

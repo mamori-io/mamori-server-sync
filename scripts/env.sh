@@ -7,19 +7,14 @@
 # See ../doc/ENVIRONMENT_VARIABLES.md for detailed documentation
 
 # Source server (where data comes from)
-export MAMORI_SERVER="https://"
-export MAMORI_USERNAME=""
-export MAMORI_PASSWORD=""
+export MAMORI_SERVER="https://sandbox.mamori.io"
+export MAMORI_USERNAME="syncapi"
+export MAMORI_PASSWORD="!Redblack30@api"
 
 # Target server (where data goes to)
-export MAMORI_SERVER2="https://"
-export MAMORI_USERNAME2=""
-export MAMORI_PASSWORD2=""
-
-
-# Active Directory providers (optional - leave empty if not using AD)
-export MAMORI_AD_PROVIDER=""
-export MAMORI_AD_PROVIDER2=""
+export MAMORI_SERVER2="https://103.100.39.162"
+export MAMORI_USERNAME2="syncapi"
+export MAMORI_PASSWORD2="!Redblack30@api"
 
 # Output directory for configuration files
 export MAMORI_OUTPUT_DIRECTORY="/app/sync"

@@ -3,6 +3,8 @@ Mamori API Sync Project
 
 **API Reference Code Location:** `../mamori-ent-js-sdk/src` (for IDE reference only - code uses yarn/npm package imports)
 
+**SDK requirement:** User disable/enable reconciliation calls `MamoriService.disable_user` and `MamoriService.enable_user` from `mamori-ent-js-sdk`. The base `mamori-api-runner` image must include a SDK build that defines `enable_user` (added in SDK releases that ship this API). If sync fails at runtime with `enable_user is not a function`, rebuild the custom image with a newer `mamori-ent-js-sdk` (see commented line in `Dockerfile.custom`).
+
 This project provides a comprehensive solution for synchronizing configuration between two Mamori servers using Docker containers with custom libraries.
 
 PREREQUISITES
@@ -59,8 +61,6 @@ QUICK START (7 Simple Steps)
    - `MAMORI_PASSWORD2` - Target server password
 
    **Optional Variables:**
-   - `MAMORI_AD_PROVIDER` - Active Directory provider name (source)
-   - `MAMORI_AD_PROVIDER2` - Active Directory provider name (target)
    - `REPORT_MODE` - Set to "true" for count-only mode
 
    **📖 For detailed documentation**: See `doc/ENVIRONMENT_VARIABLES.md`
@@ -84,6 +84,11 @@ The sync script now **automatically creates and manages AES encryption keys** fo
 - 🧹 **Automatically cleans up** temporary keys when sync completes
 - 🛡️ **Enhanced security** with temporary, single-use keys
 - ✅ **Zero configuration** required from users
+
+User MFA options are also synchronized using temporary AES keys:
+- **Mamori users**: MFA options are exported from source and restored on target
+- **Directory users**: MFA options are exported/restored on create using provider mapping
+- **Best-effort behavior**: MFA failures are logged and do not block user sync
 
 ## Object Name Filtering
 The sync script now supports filtering specific objects by name patterns:

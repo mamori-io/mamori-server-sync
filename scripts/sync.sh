@@ -1,6 +1,8 @@
 #!/bin/sh
 
-cd /home/omasri/sync
+# Run relative to this script location
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+cd "$SCRIPT_DIR/.."
 
 # Create logs directory if it doesn't exist
 mkdir -p logs
@@ -18,7 +20,6 @@ else
 fi
 
 # Use the same pattern as run_docker.sh
-SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="logs/sync_${TIMESTAMP}.log"
 

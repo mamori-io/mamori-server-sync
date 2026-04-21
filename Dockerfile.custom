@@ -6,6 +6,10 @@ RUN yarn add lodash moment
 # Add type definitions for TypeScript support
 RUN yarn add --dev @types/lodash
 
+# mamori-ent-js-sdk: sync uses MamoriService.disable_user / enable_user for user state reconcile.
+# If the base image ships an older SDK without enable_user, upgrade the package, e.g.:
+# RUN yarn add mamori-ent-js-sdk@latest
+
 # Add your custom libraries here:
 # RUN yarn add axios fs-extra uuid
 # RUN yarn add --dev @types/uuid
