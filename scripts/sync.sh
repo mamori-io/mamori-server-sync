@@ -1,8 +1,8 @@
 #!/bin/sh
 
-# Run relative to this script location
+# Repo root (parent of scripts/)
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-cd "$SCRIPT_DIR/.."
+cd "$SCRIPT_DIR/.." || exit 1
 
 # Create logs directory if it doesn't exist
 mkdir -p logs

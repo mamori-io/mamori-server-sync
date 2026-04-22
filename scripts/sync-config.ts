@@ -1606,6 +1606,7 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
         return;
     }
 
+<<<<<<< HEAD
     let tempAESKey: any = null;
     const syncMamoriMFA = isConfigActionEnabled(ACTION_SYNC_MAMORI_USER_MFA);
     const syncMamoriPassword = isConfigActionEnabled(ACTION_SYNC_MAMORI_USER_PASSWORD);
@@ -1617,6 +1618,20 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
         }
         if (!syncMamoriPassword) {
             logMain("User password sync is disabled for Mamori users; skipping password export/restore");
+=======
+    // Declared outside try so finally can cleanup (let in try is not visible in finally)
+    let tempAESKey: any = null;
+    try {
+        logMain("Starting Mamori users synchronization...");
+        
+        // Create temporary AES key for MFA options export/restore
+        try {
+            tempAESKey = await createTemporaryAESKey(api, apiKC);
+            logMain(`✅ Created temporary AES key for MFA sync: ${tempAESKey.keyName}`);
+        } catch (error) {
+            logError(`Failed to create temporary AES key for MFA sync: ${error}`);
+            logMain("⚠️ Continuing without MFA sync (users will be synced without MFA options)");
+>>>>>>> 310813d36f761c070c8b098e0ebf4ad619954d74
         }
         
         // Create temporary AES key for MFA/password export/restore
@@ -1649,9 +1664,16 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 logMain(`[TRACE ${traceId}] Source mamori_users search/list row (raw): ${stringifyApiPayload(r)}`);
                 
                 // Check if user has MFA and export options if available
+<<<<<<< HEAD
                 let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
                 if (tempAESKey && syncMamoriMFA) {
                     mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r, traceId);
+=======
+                let mfaInfo = { provider: 'none', hasMFA: false, encryptedValue: null as string | null };
+                if (tempAESKey) {
+                    const fetched = await getUserMFAProvider(api, r.username);
+                    mfaInfo = { ...fetched, encryptedValue: null as string | null };
+>>>>>>> 310813d36f761c070c8b098e0ebf4ad619954d74
                     if (mfaInfo.hasMFA) {
                         logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
                         if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for user ${r.username}`);
@@ -1765,9 +1787,16 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 logMain(`[TRACE ${traceId}] Source mamori_users search/list row (raw): ${stringifyApiPayload(r)}`);
                 
                 // Check if user has MFA and export options if available
+<<<<<<< HEAD
                 let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
                 if (tempAESKey && syncMamoriMFA) {
                     mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r, traceId);
+=======
+                let mfaInfo = { provider: 'none', hasMFA: false, encryptedValue: null as string | null };
+                if (tempAESKey) {
+                    const fetched = await getUserMFAProvider(api, r.username);
+                    mfaInfo = { ...fetched, encryptedValue: null as string | null };
+>>>>>>> 310813d36f761c070c8b098e0ebf4ad619954d74
                     if (mfaInfo.hasMFA) {
                         logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
                         if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for user ${r.username}`);
@@ -1859,7 +1888,7 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
         
     } catch (error) {
         logError(`Mamori users sync failed: ${error}`);
-        } finally {
+    } finally {
         // Cleanup temporary AES key
         if (tempAESKey && tempAESKey.cleanup) {
             try {
@@ -3857,8 +3886,20 @@ async function extractQueries() {
 // ========================================
 extractQueries()
     .catch(e => {
-        const errorMsg = e.response?.data ? e.response.data : e.toString();
-        logError(`Fatal error: ${errorMsg}`);
+        const ax = e as { response?: { status?: number; data?: unknown }; message?: string };
+        const status = ax.response?.status;
+        const data = ax.response?.data;
+        const body =
+            data == null
+                ? ''
+                : typeof data === 'object'
+                  ? JSON.stringify(data)
+                  : String(data);
+        const parts = [
+            status != null ? `HTTP ${status}` : null,
+            body || ax.message || String(e),
+        ].filter(Boolean);
+        logError(`Fatal error: ${parts.join(' — ')}`);
         process.exit(1);
     })
     .finally(() => {
