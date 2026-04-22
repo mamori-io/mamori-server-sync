@@ -29,6 +29,10 @@ const aesKey = process.env.MAMORI_AES_KEY || '';
 const mamoriKCUrl = process.env.MAMORI_SERVER2 || '';
 const mamoriKCUser = process.env.MAMORI_USERNAME2 || '';
 const mamoriKCPwd = process.env.MAMORI_PASSWORD2 || '';
+const ACTION_SYNC_MAMORI_USER_PASSWORD = "sync-mamori-user-password";
+const ACTION_SYNC_MAMORI_USER_MFA = "sync-mamori-user-mfa";
+const ACTION_SYNC_DIRECTORY_USER_MFA = "sync-directory-user_mfa";
+const DUMMY_SYNC_PASSWORD = "MamoriSyncDummyP@ssw0rd!42";
 
 const INSECURE = new io_https.Agent({ rejectUnauthorized: false });
 
@@ -80,6 +84,19 @@ function logSyncAction(action: string, itemType: string, itemName: string, statu
     }
 }
 
+/** Serialize API payloads for logs (full body, no truncation). */
+function stringifyApiPayload(value: any): string {
+    try {
+        return JSON.stringify(value);
+    } catch {
+        try {
+            return JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+        } catch {
+            return String(value);
+        }
+    }
+}
+
 // Load sync configuration
 let syncConfig: any = {};
 try {
@@ -109,6 +126,11 @@ try {
                 datasources: 1,
                 datasource_credentials: 1
             },
+            sync_actions: {
+                [ACTION_SYNC_MAMORI_USER_PASSWORD]: 0,
+                [ACTION_SYNC_MAMORI_USER_MFA]: 0,
+                [ACTION_SYNC_DIRECTORY_USER_MFA]: 0
+            },
             provider_mappings: []
         };
     }
@@ -135,6 +157,11 @@ try {
             datasources: 1,
             datasource_credentials: 1
         },
+        sync_actions: {
+            [ACTION_SYNC_MAMORI_USER_PASSWORD]: 0,
+            [ACTION_SYNC_MAMORI_USER_MFA]: 0,
+            [ACTION_SYNC_DIRECTORY_USER_MFA]: 0
+        },
         provider_mappings: []
     };
 }
@@ -142,6 +169,16 @@ try {
 // Helper function to check if an object type should be synced
 function shouldSync(objectType: string): boolean {
     return syncConfig.sync_objects && syncConfig.sync_objects[objectType] === 1;
+}
+
+function isConfigActionEnabled(actionName: string): boolean {
+    const raw = syncConfig?.sync_actions?.[actionName];
+    if (raw === 1 || raw === true) return true;
+    if (typeof raw === "string") {
+        const v = raw.trim().toLowerCase();
+        return v === "1" || v === "true" || v === "yes" || v === "on";
+    }
+    return false;
 }
 
 /**
@@ -264,6 +301,11 @@ type ExportedMFAInfo = {
     encryptedValue: string | null;
 };
 
+type RestoreMFAResult = {
+    success: boolean;
+    rawResult: any;
+};
+
 function normalizeUserDisabled(user: any): boolean | null {
     if (!user || typeof user !== 'object') {
         return null;
@@ -373,20 +415,84 @@ async function exportUserMFAIfPresent(
     username: string,
     aesKeyName: string,
     sourceUserRow?: any,
+    traceId?: string,
 ): Promise<ExportedMFAInfo> {
     const mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
     const providersHintTab = sourceUserRow ? normalizeUserProvidersString(sourceUserRow) : "";
     const sourceMfaInfo = await getUserMFAProvider(api, username, providersHintTab);
+    logMain(
+        `[TRACE ${traceId || 'no-trace'}] MFA inference for ${username}: providersHint="${providersHintTab}", inferredProvider="${sourceMfaInfo.provider}", hasMFA=${sourceMfaInfo.hasMFA}`
+    );
     mfaInfo.provider = sourceMfaInfo.provider;
     mfaInfo.hasMFA = sourceMfaInfo.hasMFA;
     if (!mfaInfo.hasMFA) {
+        logMain(`[TRACE ${traceId || 'no-trace'}] MFA export skipped for ${username}: inferred hasMFA=false`);
         return mfaInfo;
     }
-    const encryptedValue = await exportUserMFAOptions(api, username, mfaInfo.provider, aesKeyName);
+    const encryptedValue = await exportUserMFAOptions(api, username, mfaInfo.provider, aesKeyName, traceId);
     if (encryptedValue) {
         mfaInfo.encryptedValue = encryptedValue;
+        logMain(
+            `[TRACE ${traceId || 'no-trace'}] MFA export payload captured for ${username}: provider=${mfaInfo.provider}, payloadLength=${encryptedValue.length}`
+        );
+    } else {
+        logError(
+            `[TRACE ${traceId || 'no-trace'}] MFA export returned no payload for ${username}: provider=${mfaInfo.provider}, providersHint="${providersHintTab}"`
+        );
     }
     return mfaInfo;
+}
+
+/** Log raw Mamori user list row (from search/list API) and raw user_options API response. */
+async function logMamoriUserApiRaw(api: any, username: string, tracePrefix: string, label: string): Promise<void> {
+    try {
+        const users = await fetchMamoriUsers(api);
+        const row = users.find((u: any) => u?.username === username) ?? null;
+        logMain(`${tracePrefix} ${label} mamori_users search/list row for ${username}: ${stringifyApiPayload(row)}`);
+        const userOptionsRaw = await io_utils.noThrow(api.user_options(username));
+        logMain(`${tracePrefix} ${label} user_options API response for ${username}: ${stringifyApiPayload(userOptionsRaw)}`);
+    } catch (error) {
+        logError(`${tracePrefix} ${label} failed to log raw Mamori user APIs for ${username}: ${error}`);
+    }
+}
+
+function normalizedUserOptionsRowsForEquality(raw: any): string {
+    const rows = extractUserOptionsRows(raw);
+    return JSON.stringify(
+        rows
+            .map((row: any) => ({
+                option_name: String(row?.option_name ?? row?.OPTION_NAME ?? ""),
+                option_value: String(row?.option_value ?? row?.OPTION_VALUE ?? ""),
+            }))
+            .sort((a: any, b: any) => a.option_name.localeCompare(b.option_name)),
+    );
+}
+
+async function logSourceTargetUserOptionsComparison(
+    sourceApi: any,
+    targetApi: any,
+    username: string,
+    traceId: string,
+    phase: string,
+): Promise<void> {
+    const tracePrefix = `[TRACE ${traceId}]`;
+    try {
+        const sourceOptionsResult = await io_utils.noThrow(sourceApi.user_options(username));
+        const targetOptionsResult = await io_utils.noThrow(targetApi.user_options(username));
+        logMain(`${tracePrefix} ${phase} source user_options API raw for ${username}: ${stringifyApiPayload(sourceOptionsResult)}`);
+        logMain(`${tracePrefix} ${phase} target user_options API raw for ${username}: ${stringifyApiPayload(targetOptionsResult)}`);
+        const matches = normalizedUserOptionsRowsForEquality(sourceOptionsResult) === normalizedUserOptionsRowsForEquality(targetOptionsResult);
+        const sourceCount = extractUserOptionsRows(sourceOptionsResult).length;
+        const targetCount = extractUserOptionsRows(targetOptionsResult).length;
+        logMain(
+            `${tracePrefix} ${phase} user_options row equality (derived): matches=${matches}, sourceRowCount=${sourceCount}, targetRowCount=${targetCount}`,
+        );
+        if (!matches) {
+            logError(`${tracePrefix} ${phase} user_options mismatch for ${username}`);
+        }
+    } catch (error) {
+        logError(`${tracePrefix} ${phase} failed to compare user_options for ${username}: ${error}`);
+    }
 }
 
 async function restoreUserMFAIfAvailable(
@@ -395,23 +501,35 @@ async function restoreUserMFAIfAvailable(
     targetProvider: string,
     aesKeyName: string,
     mfaInfo: ExportedMFAInfo,
-    userTypeLabel: string
+    userTypeLabel: string,
+    traceId?: string,
 ): Promise<void> {
+    const tracePrefix = `[TRACE ${traceId || 'no-trace'}]`;
+    await logMamoriUserApiRaw(apiKC, username, tracePrefix, `Pre-restore target (${userTypeLabel})`);
     if (!mfaInfo.hasMFA) {
         logDetail(`${userTypeLabel} ${username} has no MFA provider to sync`);
+        logMain(`${tracePrefix} Restore skipped: mfaInfo.hasMFA=false`);
         return;
     }
     if (!mfaInfo.encryptedValue) {
         logError(`Skipping MFA restore for ${userTypeLabel.toLowerCase()} ${username}: no exported MFA payload available`);
+        logMain(`${tracePrefix} Restore skipped: encrypted MFA payload missing`);
         return;
     }
     const normalizedTargetProvider = normalizeProviderName(targetProvider || '');
     if (!normalizedTargetProvider || normalizedTargetProvider === 'none' || normalizedTargetProvider === 'password') {
         logError(`Skipping MFA restore for ${userTypeLabel.toLowerCase()} ${username}: invalid target provider "${targetProvider}"`);
+        logMain(`${tracePrefix} Restore skipped: invalid normalized target provider "${normalizedTargetProvider}"`);
         return;
     }
+    logMain(
+        `${tracePrefix} Restore call input (${userTypeLabel} ${username}): provider=${normalizedTargetProvider}, payloadLength=${mfaInfo.encryptedValue.length}, aesKey=${aesKeyName}`
+    );
     logDetail(`Restoring MFA options for ${userTypeLabel.toLowerCase()} ${username} using provider: ${normalizedTargetProvider}`);
-    const restoreSuccess = await restoreUserMFAOptions(apiKC, username, normalizedTargetProvider, mfaInfo.encryptedValue, aesKeyName);
+    const restoreResult = await restoreUserMFAOptions(apiKC, username, normalizedTargetProvider, mfaInfo.encryptedValue, aesKeyName, traceId);
+    await logMamoriUserApiRaw(apiKC, username, tracePrefix, `Post-restore target (${userTypeLabel})`);
+    logMain(`${tracePrefix} RESTORE_USER_AUTH_PROVIDER_OPTIONS_EX API response (${userTypeLabel} ${username}): ${stringifyApiPayload(restoreResult.rawResult)}`);
+    const restoreSuccess = restoreResult.success;
     if (restoreSuccess) {
         logMain(`✅ Restored MFA options for ${userTypeLabel.toLowerCase()} ${username}`);
     } else {
@@ -1325,14 +1443,31 @@ async function getUserMFAProvider(
 /**
  * Helper function to export user MFA options
  */
-async function exportUserMFAOptions(api: any, username: string, provider: string, aesKeyName: string): Promise<string | null> {
+async function exportUserMFAOptions(api: any, username: string, provider: string, aesKeyName: string, traceId?: string): Promise<string | null> {
     try {
         // #region agent log
         fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H8',location:'scripts/sync-config.ts:exportUserMFAOptions:start',message:'Attempting MFA export',data:{username,provider},timestamp:Date.now()})}).catch(()=>{});
         // #endregion
         const exportResult = await io_utils.noThrow(api.call("EXPORT_USER_AUTH_PROVIDER_OPTIONS_EX", username, provider, aesKeyName));
         if (exportResult.errors || !Array.isArray(exportResult) || exportResult.length === 0) {
-            logError(`Failed to export MFA options for user ${username}: ${exportResult.message || 'Unknown error'}`);
+            let detail: string;
+            if (exportResult && (exportResult as any).message) {
+                detail = String((exportResult as any).message);
+            } else if (Array.isArray(exportResult) && exportResult.length === 0) {
+                // Hub EXPORT_USER_AUTH_PROVIDER_OPTIONS_EX returns an empty result set when there is no row
+                // in security.user_auth_providers for (username, provider) or options are null — not a thrown error.
+                detail =
+                    `empty export result for provider "${provider}" — no encrypted row in security.user_auth_providers ` +
+                    `(user list may still show providers; options may be unset, pending validation, or out of sync)`;
+            } else if (!Array.isArray(exportResult)) {
+                detail = `unexpected response: ${stringifyApiPayload(exportResult)}`;
+            } else {
+                detail = "Unknown error";
+            }
+            logError(`Failed to export MFA options for user ${username}: ${detail}`);
+            logMain(
+                `[TRACE ${traceId || 'no-trace'}] EXPORT_USER_AUTH_PROVIDER_OPTIONS_EX API response (failure) for ${username}: ${stringifyApiPayload(exportResult)}`
+            );
             // #region agent log
             fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H8',location:'scripts/sync-config.ts:exportUserMFAOptions:error',message:'MFA export failed',data:{username,provider,exportResult},timestamp:Date.now()})}).catch(()=>{});
             // #endregion
@@ -1342,8 +1477,14 @@ async function exportUserMFAOptions(api: any, username: string, provider: string
         const exportedData = exportResult[0];
         if (!exportedData.value) {
             logError(`Export result missing value for user ${username}`);
+            logMain(
+                `[TRACE ${traceId || 'no-trace'}] EXPORT_USER_AUTH_PROVIDER_OPTIONS_EX API response (no value field) for ${username}: ${stringifyApiPayload(exportResult)}`,
+            );
             return null;
         }
+        logMain(
+            `[TRACE ${traceId || 'no-trace'}] EXPORT_USER_AUTH_PROVIDER_OPTIONS_EX API response (success) for ${username}: ${stringifyApiPayload(exportResult)}`,
+        );
         // #region agent log
         fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H8',location:'scripts/sync-config.ts:exportUserMFAOptions:success',message:'MFA export succeeded',data:{username,provider,hasEncryptedValue:!!exportedData.value},timestamp:Date.now()})}).catch(()=>{});
         // #endregion
@@ -1358,22 +1499,100 @@ async function exportUserMFAOptions(api: any, username: string, provider: string
 /**
  * Helper function to restore user MFA options
  */
-async function restoreUserMFAOptions(api: any, username: string, provider: string, encryptedValue: string, aesKeyName: string): Promise<boolean> {
+async function restoreUserMFAOptions(
+    api: any,
+    username: string,
+    provider: string,
+    encryptedValue: string,
+    aesKeyName: string,
+    traceId?: string,
+): Promise<RestoreMFAResult> {
     try {
+        const tracePrefix = `[TRACE ${traceId || 'no-trace'}]`;
         const restoreResult = await io_utils.noThrow(api.call("RESTORE_USER_AUTH_PROVIDER_OPTIONS_EX", username, provider, encryptedValue, aesKeyName, null));
         if (restoreResult.errors) {
             logError(`Failed to restore MFA options for user ${username}: ${restoreResult.message || 'Unknown error'}`);
-            return false;
+            return { success: false, rawResult: restoreResult };
         }
         
         if (Array.isArray(restoreResult) && restoreResult.length > 0 && restoreResult[0].status === 'OK') {
-            return true;
+            return { success: true, rawResult: restoreResult };
         }
         
         logError(`Restore result invalid for user ${username}`);
-        return false;
+        logMain(`${tracePrefix} restore invalid payload for ${username}: ${JSON.stringify(restoreResult)}`);
+        return { success: false, rawResult: restoreResult };
     } catch (error) {
         logError(`Failed to restore MFA options for user ${username}: ${error}`);
+        return { success: false, rawResult: { caughtError: String(error) } };
+    }
+}
+
+async function exportUserPasswordBlob(
+    api: any,
+    username: string,
+    aesKeyName: string,
+    traceId?: string,
+): Promise<string | null> {
+    const tracePrefix = `[TRACE ${traceId || 'no-trace'}]`;
+    try {
+        const exportResult = await io_utils.noThrow(api.call("EXPORT_USER_PASSWORD_EX", username, aesKeyName));
+        if (exportResult?.errors) {
+            logError(`${tracePrefix} Failed to export password blob for ${username}: ${exportResult.message || "Unknown error"}`);
+            return null;
+        }
+        if (!Array.isArray(exportResult) || exportResult.length === 0 || !exportResult[0]?.value) {
+            logError(`${tracePrefix} Invalid EXPORT_USER_PASSWORD_EX payload for ${username}: ${stringifyApiPayload(exportResult)}`);
+            return null;
+        }
+        logMain(`${tracePrefix} Exported password blob for ${username} (length=${String(exportResult[0].value).length})`);
+        return String(exportResult[0].value);
+    } catch (error) {
+        logError(`${tracePrefix} Failed to export password blob for ${username}: ${error}`);
+        return null;
+    }
+}
+
+async function restoreUserPasswordBlob(
+    apiKC: any,
+    username: string,
+    encryptedValue: string,
+    aesKeyName: string,
+    traceId?: string,
+): Promise<boolean> {
+    const tracePrefix = `[TRACE ${traceId || 'no-trace'}]`;
+    try {
+        const restoreResult = await io_utils.noThrow(apiKC.call("RESTORE_USER_PASSWORD_EX", username, encryptedValue, aesKeyName));
+        if (restoreResult?.errors) {
+            logError(`${tracePrefix} Failed to restore password blob for ${username}: ${restoreResult.message || "Unknown error"}`);
+            return false;
+        }
+        const ok = Array.isArray(restoreResult) && restoreResult.length > 0 && restoreResult[0]?.status === "OK";
+        if (!ok) {
+            logError(`${tracePrefix} Invalid RESTORE_USER_PASSWORD_EX payload for ${username}: ${stringifyApiPayload(restoreResult)}`);
+            return false;
+        }
+        logMain(`${tracePrefix} Restored password blob for ${username}`);
+        return true;
+    } catch (error) {
+        logError(`${tracePrefix} Failed to restore password blob for ${username}: ${error}`);
+        return false;
+    }
+}
+
+async function activateMamoriUser(apiKC: any, username: string, traceId?: string): Promise<boolean> {
+    const tracePrefix = `[TRACE ${traceId || 'no-trace'}]`;
+    try {
+        const sql = `ALTER USER ${username} SET VALIDATED = TRUE`;
+        const activateResult = await io_utils.noThrow(apiKC.select(sql));
+        if (activateResult?.errors) {
+            logError(`${tracePrefix} Failed to activate user ${username}: ${activateResult.message || "Unknown error"}`);
+            return false;
+        }
+        logMain(`${tracePrefix} Activated user ${username} on target`);
+        return true;
+    } catch (error) {
+        logError(`${tracePrefix} Failed to activate user ${username}: ${error}`);
         return false;
     }
 }
@@ -1388,17 +1607,27 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
     }
 
     let tempAESKey: any = null;
+    const syncMamoriMFA = isConfigActionEnabled(ACTION_SYNC_MAMORI_USER_MFA);
+    const syncMamoriPassword = isConfigActionEnabled(ACTION_SYNC_MAMORI_USER_PASSWORD);
 
     try {
         logMain("Starting Mamori users synchronization...");
+        if (!syncMamoriMFA) {
+            logMain("User MFA sync is disabled for Mamori users; skipping MFA export/restore");
+        }
+        if (!syncMamoriPassword) {
+            logMain("User password sync is disabled for Mamori users; skipping password export/restore");
+        }
         
-        // Create temporary AES key for MFA options export/restore
-        try {
-            tempAESKey = await createTemporaryAESKey(api, apiKC);
-            logMain(`✅ Created temporary AES key for MFA sync: ${tempAESKey.keyName}`);
-        } catch (error) {
-            logError(`Failed to create temporary AES key for MFA sync: ${error}`);
-            logMain("⚠️ Continuing without MFA sync (users will be synced without MFA options)");
+        // Create temporary AES key for MFA/password export/restore
+        if (syncMamoriMFA || syncMamoriPassword) {
+            try {
+                tempAESKey = await createTemporaryAESKey(api, apiKC);
+                logMain(`✅ Created temporary AES key for Mamori user sync: ${tempAESKey.keyName}`);
+            } catch (error) {
+                logError(`Failed to create temporary AES key for Mamori user sync: ${error}`);
+                logMain("⚠️ Continuing without Mamori user MFA/password export-restore");
+            }
         }
         
         let dataKJ = await fetchMamoriUsers(api);
@@ -1415,34 +1644,59 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
         logMain(`Found ${newItems.length} new Mamori users to create`);
         for (let r of newItems) {
             try {
+                const traceId = `${Date.now()}-${r.username}-mamori-create`;
                 logMain(`Creating Mamori user: ${r.username}`);
+                logMain(`[TRACE ${traceId}] Source mamori_users search/list row (raw): ${stringifyApiPayload(r)}`);
                 
                 // Check if user has MFA and export options if available
                 let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
-                if (tempAESKey) {
-                    mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r);
+                if (tempAESKey && syncMamoriMFA) {
+                    mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r, traceId);
                     if (mfaInfo.hasMFA) {
                         logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
                         if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for user ${r.username}`);
                         else logError(`Failed to export MFA options for user ${r.username}, continuing without MFA`);
                     }
                 }
+                let passwordBlob: string | null = null;
+                if (tempAESKey && syncMamoriPassword) {
+                    passwordBlob = await exportUserPasswordBlob(api, r.username, tempAESKey.keyName, traceId);
+                }
                 
                 let user = new io_user.User(r.username)
                     .withEmail(r.email || '')
                     .withFullName(r.fullname || '');
-                let res = await io_utils.noThrow(user.create(apiKC, r.password || ''));
+                const createPassword = syncMamoriPassword ? DUMMY_SYNC_PASSWORD : (r.password || '');
+                let res = await io_utils.noThrow(user.create(apiKC, createPassword));
+                logMain(`[TRACE ${traceId}] Target user.create API response for ${r.username}: ${stringifyApiPayload(res)}`);
                 if (res.errors) {
                     logSyncAction("CREATE", "Mamori User", r.username, "error", res.message || "Unknown error");
                     logError(`Failed to create Mamori user ${r.username}: ${res.message}`);
                 } else {
                     logSyncAction("CREATE", "Mamori User", r.username, "success");
                     logMain(`✅ Created Mamori user: ${r.username}`);
+                    await logMamoriUserApiRaw(apiKC, r.username, `[TRACE ${traceId}]`, "Post-create pre-restore target");
                     
-                    // Restore MFA options if available
-                    if (tempAESKey) {
-                        await restoreUserMFAIfAvailable(apiKC, r.username, mfaInfo.provider, tempAESKey.keyName, mfaInfo, "Mamori User");
+                    // Restore password blob for login workflow
+                    if (tempAESKey && syncMamoriPassword) {
+                        const activated = await activateMamoriUser(apiKC, r.username, traceId);
+                        if (!activated) {
+                            logError(`[TRACE ${traceId}] Password restore skipped for ${r.username}: activate failed`);
+                        } else if (passwordBlob) {
+                            const restored = await restoreUserPasswordBlob(apiKC, r.username, passwordBlob, tempAESKey.keyName, traceId);
+                            if (!restored) {
+                                logError(`[TRACE ${traceId}] Password restore failed for ${r.username}`);
+                            }
+                        } else {
+                            logError(`[TRACE ${traceId}] Password restore skipped for ${r.username}: export payload missing`);
+                        }
                     }
+
+                    // Restore MFA options if available
+                    if (tempAESKey && syncMamoriMFA) {
+                        await restoreUserMFAIfAvailable(apiKC, r.username, mfaInfo.provider, tempAESKey.keyName, mfaInfo, "Mamori User", traceId);
+                    }
+                    await logSourceTargetUserOptionsComparison(api, apiKC, r.username, traceId, "post-create");
                     const sourceDisabled = normalizeUserDisabled(r);
                     const createdTarget = (await fetchMamoriUsers(apiKC)).find((u: any) => u.username === r.username) || null;
                     logMain(
@@ -1506,34 +1760,54 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
         
         for (let r of updatedItems) {
             try {
+                const traceId = `${Date.now()}-${r.username}-mamori-update`;
                 logMain(`Updating Mamori user: ${r.username}`);
+                logMain(`[TRACE ${traceId}] Source mamori_users search/list row (raw): ${stringifyApiPayload(r)}`);
                 
                 // Check if user has MFA and export options if available
                 let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
-                if (tempAESKey) {
-                    mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r);
+                if (tempAESKey && syncMamoriMFA) {
+                    mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r, traceId);
                     if (mfaInfo.hasMFA) {
                         logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
                         if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for user ${r.username}`);
                         else logError(`Failed to export MFA options for user ${r.username}, continuing without MFA`);
                     }
                 }
+                let passwordBlob: string | null = null;
+                if (tempAESKey && syncMamoriPassword) {
+                    passwordBlob = await exportUserPasswordBlob(api, r.username, tempAESKey.keyName, traceId);
+                }
                 
                 let user = new io_user.User(r.username)
                     .withEmail(r.email || '')
                     .withFullName(r.fullname || '');
                 let res = await io_utils.noThrow(user.update(apiKC));
+                logMain(`[TRACE ${traceId}] Target user.update API response for ${r.username}: ${stringifyApiPayload(res)}`);
                 if (res.errors) {
                     logSyncAction("UPDATE", "Mamori User", r.username, "error", res.message || "Unknown error");
                     logError(`Failed to update Mamori user ${r.username}: ${res.message}`);
                 } else {
                     logSyncAction("UPDATE", "Mamori User", r.username, "success");
                     logMain(`✅ Updated Mamori user: ${r.username}`);
+                    await logMamoriUserApiRaw(apiKC, r.username, `[TRACE ${traceId}]`, "Post-update pre-restore target");
                     
-                    // Restore MFA options if available
-                    if (tempAESKey) {
-                        await restoreUserMFAIfAvailable(apiKC, r.username, mfaInfo.provider, tempAESKey.keyName, mfaInfo, "Mamori User");
+                    if (tempAESKey && syncMamoriPassword) {
+                        if (passwordBlob) {
+                            const restored = await restoreUserPasswordBlob(apiKC, r.username, passwordBlob, tempAESKey.keyName, traceId);
+                            if (!restored) {
+                                logError(`[TRACE ${traceId}] Password restore failed for ${r.username}`);
+                            }
+                        } else {
+                            logError(`[TRACE ${traceId}] Password restore skipped for ${r.username}: export payload missing`);
+                        }
                     }
+
+                    // Restore MFA options if available
+                    if (tempAESKey && syncMamoriMFA) {
+                        await restoreUserMFAIfAvailable(apiKC, r.username, mfaInfo.provider, tempAESKey.keyName, mfaInfo, "Mamori User", traceId);
+                    }
+                    await logSourceTargetUserOptionsComparison(api, apiKC, r.username, traceId, "post-update");
                     const refreshedTarget = (await fetchMamoriUsers(apiKC)).find((u: any) => u.username === r.username) || null;
                     const sourceDisabled = normalizeUserDisabled(r);
                     const targetDisabled = normalizeUserDisabled(refreshedTarget);
@@ -1609,17 +1883,23 @@ async function syncDirectoryUsers(api: any, apiKC: any, syncedProviders: string[
     }
 
     let tempAESKey: any = null;
+    const syncDirectoryMFA = isConfigActionEnabled(ACTION_SYNC_DIRECTORY_USER_MFA);
 
     try {
         logMain("Starting directory users synchronization...");
+        if (!syncDirectoryMFA) {
+            logMain("User MFA sync is disabled for directory users; skipping MFA export/restore");
+        }
         
         // Create temporary AES key for MFA options export/restore
-        try {
-            tempAESKey = await createTemporaryAESKey(api, apiKC);
-            logMain(`✅ Created temporary AES key for directory user MFA sync: ${tempAESKey.keyName}`);
-        } catch (error) {
-            logError(`Failed to create temporary AES key for directory user MFA sync: ${error}`);
-            logMain("⚠️ Continuing without directory user MFA sync (users will be synced without MFA options)");
+        if (syncDirectoryMFA) {
+            try {
+                tempAESKey = await createTemporaryAESKey(api, apiKC);
+                logMain(`✅ Created temporary AES key for directory user MFA sync: ${tempAESKey.keyName}`);
+            } catch (error) {
+                logError(`Failed to create temporary AES key for directory user MFA sync: ${error}`);
+                logMain("⚠️ Continuing without directory user MFA sync (users will be synced without MFA options)");
+            }
         }
         
         let dataKJ = await fetchDirectoryUsers(api);
@@ -1659,7 +1939,7 @@ async function syncDirectoryUsers(api: any, apiKC: any, syncedProviders: string[
                 
                 // Check if user has MFA and export options if available
                 let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
-                if (tempAESKey) {
+                if (tempAESKey && syncDirectoryMFA) {
                     mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r);
                     if (mfaInfo.hasMFA) {
                         logDetail(`Directory user ${r.username} has MFA provider: ${mfaInfo.provider}`);
@@ -1683,7 +1963,7 @@ async function syncDirectoryUsers(api: any, apiKC: any, syncedProviders: string[
                     logMain(`✅ Created directory user: ${r.username}`);
                     
                     // Restore MFA options if available
-                    if (tempAESKey) {
+                    if (tempAESKey && syncDirectoryMFA) {
                         await restoreUserMFAIfAvailable(apiKC, r.username, mappedTargetProvider, tempAESKey.keyName, mfaInfo, "Directory User");
                     }
                     const createdTarget = (await fetchDirectoryUsers(apiKC)).find((u: any) =>
@@ -1714,7 +1994,7 @@ async function syncDirectoryUsers(api: any, apiKC: any, syncedProviders: string[
                 normalizeUserDisabled(targetUser)
             );
 
-            if (tempAESKey) {
+            if (tempAESKey && syncDirectoryMFA) {
                 const mappedTargetProvider = getMappedTargetProvider(sourceUser.provider || '');
                 let mfaInfo: ExportedMFAInfo = await exportUserMFAIfPresent(api, sourceUser.username, tempAESKey.keyName, sourceUser);
                 if (mfaInfo.hasMFA) {
@@ -3506,6 +3786,10 @@ async function extractQueries() {
     logMain(`  - Role Grants: ${syncConfig.sync_objects?.role_grants ? "ENABLED" : "DISABLED"}`);
     logMain(`  - Role Permissions: ${syncConfig.sync_objects?.role_permissions ? "ENABLED" : "DISABLED"}`);
     logMain(`  - On-Demand Policies: ${syncConfig.sync_objects?.on_demand_policies ? "ENABLED" : "DISABLED"}`);
+    logMain("Configuration loaded - Sync actions:");
+    logMain(`  - ${ACTION_SYNC_MAMORI_USER_PASSWORD}: ${isConfigActionEnabled(ACTION_SYNC_MAMORI_USER_PASSWORD) ? "ENABLED" : "DISABLED"}`);
+    logMain(`  - ${ACTION_SYNC_MAMORI_USER_MFA}: ${isConfigActionEnabled(ACTION_SYNC_MAMORI_USER_MFA) ? "ENABLED" : "DISABLED"}`);
+    logMain(`  - ${ACTION_SYNC_DIRECTORY_USER_MFA}: ${isConfigActionEnabled(ACTION_SYNC_DIRECTORY_USER_MFA) ? "ENABLED" : "DISABLED"}`);
     logMain("========================================");
 
     if (!isReportMode()) {

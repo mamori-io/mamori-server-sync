@@ -31,6 +31,11 @@
     "test_mode": true,
     "test_limit": 3
   },
+  "sync_actions": {
+    "sync-mamori-user-password": 0,
+    "sync-mamori-user-mfa": 0,
+    "sync-directory-user_mfa": 0
+  },
   "provider_mappings": [
     {
       "source_provider": "ad_sandbox",
