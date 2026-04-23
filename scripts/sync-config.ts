@@ -34,6 +34,11 @@ const ACTION_SYNC_MAMORI_USER_MFA = "sync-mamori-user-mfa";
 const ACTION_SYNC_DIRECTORY_USER_MFA = "sync-directory-user_mfa";
 const DUMMY_SYNC_PASSWORD = "MamoriSyncDummyP@ssw0rd!42";
 
+const SYNC_DEBUG_AUTH = (() => {
+    const v = String(process.env.SYNC_DEBUG_AUTH || "").trim().toLowerCase();
+    return v === "1" || v === "true" || v === "yes" || v === "on";
+})();
+
 const INSECURE = new io_https.Agent({ rejectUnauthorized: false });
 
 const outputFile = process.env.MAMORI_OUTPUT_DIRECTORY + "mamori-config.json";
@@ -95,6 +100,34 @@ function stringifyApiPayload(value: any): string {
             return String(value);
         }
     }
+}
+
+/**
+ * Replaces `value` string fields (password-export blobs) with a length label so results can be logged safely.
+ */
+function redactPasswordApiPayloadForLog(obj: any, depth = 0): any {
+    if (depth > 8) return "<max depth>";
+    if (obj == null) return obj;
+    if (Array.isArray(obj)) {
+        return obj.map((e) => redactPasswordApiPayloadForLog(e, depth + 1));
+    }
+    if (typeof obj === "object") {
+        const o: any = { ...obj };
+        if (typeof o.value === "string" && o.value.length > 0) {
+            o.value = `<redacted, ${o.value.length} chars>`;
+        }
+        return o;
+    }
+    return obj;
+}
+
+/** If SYNC_DEBUG_AUTH=1, logs to main and error log with [auth-debug] prefix. Never log raw passwords or blobs. */
+function logDebugAuth(message: string) {
+    if (!SYNC_DEBUG_AUTH) return;
+    const line = `[auth-debug] ${message}`;
+    logMain(line);
+    const ts = new Date().toISOString();
+    fs.appendFileSync(errorLogFile, `[${ts}] ${line}\n`);
 }
 
 // Load sync configuration
@@ -1535,20 +1568,34 @@ async function exportUserPasswordBlob(
     traceId?: string,
 ): Promise<string | null> {
     const tracePrefix = `[TRACE ${traceId || 'no-trace'}]`;
+    logDebugAuth(
+        `EXPORT_USER_PASSWORD_EX start ${username} key=${aesKeyName} ${tracePrefix}`,
+    );
     try {
         const exportResult = await io_utils.noThrow(api.call("EXPORT_USER_PASSWORD_EX", username, aesKeyName));
         if (exportResult?.errors) {
             logError(`${tracePrefix} Failed to export password blob for ${username}: ${exportResult.message || "Unknown error"}`);
+            logDebugAuth(
+                `EXPORT_USER_PASSWORD_EX failed (errors) ${username}: ${stringifyApiPayload(redactPasswordApiPayloadForLog(exportResult))} ${tracePrefix}`,
+            );
             return null;
         }
         if (!Array.isArray(exportResult) || exportResult.length === 0 || !exportResult[0]?.value) {
             logError(`${tracePrefix} Invalid EXPORT_USER_PASSWORD_EX payload for ${username}: ${stringifyApiPayload(exportResult)}`);
+            logDebugAuth(
+                `EXPORT_USER_PASSWORD_EX invalid payload for ${username}: ${stringifyApiPayload(redactPasswordApiPayloadForLog(exportResult))} ${tracePrefix}`,
+            );
             return null;
         }
-        logMain(`${tracePrefix} Exported password blob for ${username} (length=${String(exportResult[0].value).length})`);
+        const blobLen = String(exportResult[0].value).length;
+        logMain(`${tracePrefix} Exported password blob for ${username} (length=${blobLen})`);
+        logDebugAuth(
+            `EXPORT_USER_PASSWORD_EX success ${username}: blobLength=${blobLen} ${tracePrefix}`,
+        );
         return String(exportResult[0].value);
     } catch (error) {
         logError(`${tracePrefix} Failed to export password blob for ${username}: ${error}`);
+        logDebugAuth(`EXPORT_USER_PASSWORD_EX exception ${username}: ${error} ${tracePrefix}`);
         return null;
     }
 }
@@ -1561,38 +1608,59 @@ async function restoreUserPasswordBlob(
     traceId?: string,
 ): Promise<boolean> {
     const tracePrefix = `[TRACE ${traceId || 'no-trace'}]`;
+    logDebugAuth(
+        `RESTORE_USER_PASSWORD_EX start ${username} blobLength=${encryptedValue ? encryptedValue.length : 0} key=${aesKeyName} ${tracePrefix}`,
+    );
     try {
         const restoreResult = await io_utils.noThrow(apiKC.call("RESTORE_USER_PASSWORD_EX", username, encryptedValue, aesKeyName));
         if (restoreResult?.errors) {
             logError(`${tracePrefix} Failed to restore password blob for ${username}: ${restoreResult.message || "Unknown error"}`);
+            logDebugAuth(
+                `RESTORE_USER_PASSWORD_EX failed (errors) ${username}: ${stringifyApiPayload(redactPasswordApiPayloadForLog(restoreResult))} ${tracePrefix}`,
+            );
             return false;
         }
         const ok = Array.isArray(restoreResult) && restoreResult.length > 0 && restoreResult[0]?.status === "OK";
         if (!ok) {
             logError(`${tracePrefix} Invalid RESTORE_USER_PASSWORD_EX payload for ${username}: ${stringifyApiPayload(restoreResult)}`);
+            logDebugAuth(
+                `RESTORE_USER_PASSWORD_EX not OK for ${username}: ${stringifyApiPayload(redactPasswordApiPayloadForLog(restoreResult))} ${tracePrefix}`,
+            );
             return false;
         }
         logMain(`${tracePrefix} Restored password blob for ${username}`);
+        logDebugAuth(
+            `RESTORE_USER_PASSWORD_EX success ${username}: status=${JSON.stringify((restoreResult as any[])?.[0]?.status)} ${tracePrefix}`,
+        );
         return true;
     } catch (error) {
         logError(`${tracePrefix} Failed to restore password blob for ${username}: ${error}`);
+        logDebugAuth(`RESTORE_USER_PASSWORD_EX exception ${username}: ${error} ${tracePrefix}`);
         return false;
     }
 }
 
 async function activateMamoriUser(apiKC: any, username: string, traceId?: string): Promise<boolean> {
     const tracePrefix = `[TRACE ${traceId || 'no-trace'}]`;
+    logDebugAuth(`activateMamoriUser(VALIDATED=TRUE) start ${username} ${tracePrefix}`);
     try {
         const sql = `ALTER USER ${username} SET VALIDATED = TRUE`;
         const activateResult = await io_utils.noThrow(apiKC.select(sql));
         if (activateResult?.errors) {
             logError(`${tracePrefix} Failed to activate user ${username}: ${activateResult.message || "Unknown error"}`);
+            logDebugAuth(
+                `activateMamoriUser failed for ${username}: ${stringifyApiPayload(redactPasswordApiPayloadForLog(activateResult))} ${tracePrefix}`,
+            );
             return false;
         }
         logMain(`${tracePrefix} Activated user ${username} on target`);
+        logDebugAuth(
+            `activateMamoriUser success for ${username}: ${stringifyApiPayload(redactPasswordApiPayloadForLog(activateResult))} ${tracePrefix}`,
+        );
         return true;
     } catch (error) {
         logError(`${tracePrefix} Failed to activate user ${username}: ${error}`);
+        logDebugAuth(`activateMamoriUser exception for ${username}: ${error} ${tracePrefix}`);
         return false;
     }
 }
@@ -1606,7 +1674,6 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
         return;
     }
 
-<<<<<<< HEAD
     let tempAESKey: any = null;
     const syncMamoriMFA = isConfigActionEnabled(ACTION_SYNC_MAMORI_USER_MFA);
     const syncMamoriPassword = isConfigActionEnabled(ACTION_SYNC_MAMORI_USER_PASSWORD);
@@ -1618,20 +1685,6 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
         }
         if (!syncMamoriPassword) {
             logMain("User password sync is disabled for Mamori users; skipping password export/restore");
-=======
-    // Declared outside try so finally can cleanup (let in try is not visible in finally)
-    let tempAESKey: any = null;
-    try {
-        logMain("Starting Mamori users synchronization...");
-        
-        // Create temporary AES key for MFA options export/restore
-        try {
-            tempAESKey = await createTemporaryAESKey(api, apiKC);
-            logMain(`✅ Created temporary AES key for MFA sync: ${tempAESKey.keyName}`);
-        } catch (error) {
-            logError(`Failed to create temporary AES key for MFA sync: ${error}`);
-            logMain("⚠️ Continuing without MFA sync (users will be synced without MFA options)");
->>>>>>> 310813d36f761c070c8b098e0ebf4ad619954d74
         }
         
         // Create temporary AES key for MFA/password export/restore
@@ -1643,6 +1696,24 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 logError(`Failed to create temporary AES key for Mamori user sync: ${error}`);
                 logMain("⚠️ Continuing without Mamori user MFA/password export-restore");
             }
+        }
+
+        logDebugAuth("--- Mamori user password / login diagnostics ---");
+        logDebugAuth(
+            `config: ${ACTION_SYNC_MAMORI_USER_PASSWORD}=${syncMamoriPassword} ${ACTION_SYNC_MAMORI_USER_MFA}=${syncMamoriMFA} tempAESKey=${tempAESKey ? "yes" : "no"}${tempAESKey?.keyName ? " name=" + tempAESKey.keyName : ""}`,
+        );
+        if (!syncMamoriPassword) {
+            logDebugAuth(
+                "With password sync OFF, user.create uses the list row password only (usually empty). Target logins will not match the source account password; enable sync-mamori-user-password to copy the encrypted password blob.",
+            );
+        } else if (!tempAESKey) {
+            logDebugAuth(
+                "Password sync is ON but temp AES key missing; password export/restore is skipped. Check AES key setup on source and target.",
+            );
+        } else {
+            logDebugAuth(
+                "Password sync is ON: new users use a placeholder at create, then activate + RESTORE_USER_PASSWORD_EX; a successful run should make login match the source password (same user).",
+            );
         }
         
         let dataKJ = await fetchMamoriUsers(api);
@@ -1664,16 +1735,9 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 logMain(`[TRACE ${traceId}] Source mamori_users search/list row (raw): ${stringifyApiPayload(r)}`);
                 
                 // Check if user has MFA and export options if available
-<<<<<<< HEAD
                 let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
                 if (tempAESKey && syncMamoriMFA) {
                     mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r, traceId);
-=======
-                let mfaInfo = { provider: 'none', hasMFA: false, encryptedValue: null as string | null };
-                if (tempAESKey) {
-                    const fetched = await getUserMFAProvider(api, r.username);
-                    mfaInfo = { ...fetched, encryptedValue: null as string | null };
->>>>>>> 310813d36f761c070c8b098e0ebf4ad619954d74
                     if (mfaInfo.hasMFA) {
                         logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
                         if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for user ${r.username}`);
@@ -1689,6 +1753,12 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                     .withEmail(r.email || '')
                     .withFullName(r.fullname || '');
                 const createPassword = syncMamoriPassword ? DUMMY_SYNC_PASSWORD : (r.password || '');
+                {
+                    const listPwdLen = r.password && typeof r.password === "string" ? r.password.length : 0;
+                    logDebugAuth(
+                        `Mamori user create ${r.username}: atCreateMode=${syncMamoriPassword ? "placeholder_then_restore" : "list_row_only"} listRowPasswordLength=${listPwdLen} willCallExportPassword=${!!(tempAESKey && syncMamoriPassword)} [TRACE ${traceId}]`
+                    );
+                }
                 let res = await io_utils.noThrow(user.create(apiKC, createPassword));
                 logMain(`[TRACE ${traceId}] Target user.create API response for ${r.username}: ${stringifyApiPayload(res)}`);
                 if (res.errors) {
@@ -1702,16 +1772,24 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                     // Restore password blob for login workflow
                     if (tempAESKey && syncMamoriPassword) {
                         const activated = await activateMamoriUser(apiKC, r.username, traceId);
+                        let restored: boolean | null = null;
                         if (!activated) {
                             logError(`[TRACE ${traceId}] Password restore skipped for ${r.username}: activate failed`);
                         } else if (passwordBlob) {
-                            const restored = await restoreUserPasswordBlob(apiKC, r.username, passwordBlob, tempAESKey.keyName, traceId);
+                            restored = await restoreUserPasswordBlob(apiKC, r.username, passwordBlob, tempAESKey.keyName, traceId);
                             if (!restored) {
                                 logError(`[TRACE ${traceId}] Password restore failed for ${r.username}`);
                             }
                         } else {
                             logError(`[TRACE ${traceId}] Password restore skipped for ${r.username}: export payload missing`);
                         }
+                        logDebugAuth(
+                            `Mamori user create ${r.username} post-create password pipeline: activated=${activated} hadExportBlob=${!!passwordBlob} restoreOk=${restored === true ? "yes" : restored === false ? "no" : "not_attempted"} (login on target should match source if restoreOk=yes) [TRACE ${traceId}]`
+                        );
+                    } else {
+                        logDebugAuth(
+                            `Mamori user create ${r.username} post-create: no password export/restore (tempAESKey=${!!tempAESKey} syncMamoriPassword=${syncMamoriPassword}) [TRACE ${traceId}]`
+                        );
                     }
 
                     // Restore MFA options if available
@@ -1787,16 +1865,9 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 logMain(`[TRACE ${traceId}] Source mamori_users search/list row (raw): ${stringifyApiPayload(r)}`);
                 
                 // Check if user has MFA and export options if available
-<<<<<<< HEAD
                 let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
                 if (tempAESKey && syncMamoriMFA) {
                     mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r, traceId);
-=======
-                let mfaInfo = { provider: 'none', hasMFA: false, encryptedValue: null as string | null };
-                if (tempAESKey) {
-                    const fetched = await getUserMFAProvider(api, r.username);
-                    mfaInfo = { ...fetched, encryptedValue: null as string | null };
->>>>>>> 310813d36f761c070c8b098e0ebf4ad619954d74
                     if (mfaInfo.hasMFA) {
                         logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
                         if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for user ${r.username}`);
@@ -1807,6 +1878,9 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 if (tempAESKey && syncMamoriPassword) {
                     passwordBlob = await exportUserPasswordBlob(api, r.username, tempAESKey.keyName, traceId);
                 }
+                logDebugAuth(
+                    `Mamori user update ${r.username}: willRestorePasswordAfterUpdate=${!!(tempAESKey && syncMamoriPassword)} hasExportBlob=${!!passwordBlob} [TRACE ${traceId}]`
+                );
                 
                 let user = new io_user.User(r.username)
                     .withEmail(r.email || '')
@@ -1822,14 +1896,22 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                     await logMamoriUserApiRaw(apiKC, r.username, `[TRACE ${traceId}]`, "Post-update pre-restore target");
                     
                     if (tempAESKey && syncMamoriPassword) {
+                        let restored: boolean | null = null;
                         if (passwordBlob) {
-                            const restored = await restoreUserPasswordBlob(apiKC, r.username, passwordBlob, tempAESKey.keyName, traceId);
+                            restored = await restoreUserPasswordBlob(apiKC, r.username, passwordBlob, tempAESKey.keyName, traceId);
                             if (!restored) {
                                 logError(`[TRACE ${traceId}] Password restore failed for ${r.username}`);
                             }
                         } else {
                             logError(`[TRACE ${traceId}] Password restore skipped for ${r.username}: export payload missing`);
                         }
+                        logDebugAuth(
+                            `Mamori user update ${r.username} post-update password: hadExportBlob=${!!passwordBlob} restoreOk=${restored === true ? "yes" : restored === false ? "no" : "not_attempted"} [TRACE ${traceId}]`
+                        );
+                    } else {
+                        logDebugAuth(
+                            `Mamori user update ${r.username} post-update: no password restore (tempAESKey=${!!tempAESKey} syncMamoriPassword=${syncMamoriPassword}) [TRACE ${traceId}]`
+                        );
                     }
 
                     // Restore MFA options if available
@@ -3819,6 +3901,7 @@ async function extractQueries() {
     logMain(`  - ${ACTION_SYNC_MAMORI_USER_PASSWORD}: ${isConfigActionEnabled(ACTION_SYNC_MAMORI_USER_PASSWORD) ? "ENABLED" : "DISABLED"}`);
     logMain(`  - ${ACTION_SYNC_MAMORI_USER_MFA}: ${isConfigActionEnabled(ACTION_SYNC_MAMORI_USER_MFA) ? "ENABLED" : "DISABLED"}`);
     logMain(`  - ${ACTION_SYNC_DIRECTORY_USER_MFA}: ${isConfigActionEnabled(ACTION_SYNC_DIRECTORY_USER_MFA) ? "ENABLED" : "DISABLED"}`);
+    logDebugAuth("SYNC_DEBUG_AUTH is on — [auth-debug] lines will be written for password/MFA transfer steps (grep main or error log).");
     logMain("========================================");
 
     if (!isReportMode()) {
