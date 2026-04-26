@@ -272,6 +272,37 @@ function getObjectFilters(objectType: string): string[] {
     return syncConfig.object_filters?.[objectType as keyof typeof syncConfig.object_filters] as string[] || [];
 }
 
+/**
+ * Hub `PUT /v1/search/users` builds `lower(username) in (#{value})` for filter comparator `"in"`.
+ * `value` must be a single SQL fragment: comma-separated quoted literals (see vagrant/dm `datastore.ex`).
+ */
+function buildMamoriUsernameSqlInListFragment(usernames: string[]): string {
+    return usernames
+        .map((u) => `'${String(u).replace(/'/g, "''").toLowerCase()}'`)
+        .join(",");
+}
+
+/**
+ * If `object_filters` entry is a single anchored name `^username$` with no regex metacharacters
+ * in the name, we can push the filter to `PUT /v1/search/users` via `User.list` (prefer `in`, fallback `=`).
+ */
+function literalMamoriUsernameForSearchFilter(pattern: string): string | null {
+    const m = String(pattern || "")
+        .trim()
+        .match(/^\^([\s\S]+)\$$/);
+    if (!m) {
+        return null;
+    }
+    const inner = m[1];
+    if (!inner) {
+        return null;
+    }
+    if (/[\\^$.*+?()[\]{}|]/.test(inner)) {
+        return null;
+    }
+    return inner;
+}
+
 function buildUserSearchPayload(objectType: string): any {
     const payload: any = { skip: 0, take: 1000 };
     const filters = getObjectFilters(objectType);
@@ -296,23 +327,49 @@ async function fetchDirectoryUsers(api: any): Promise<any[]> {
 }
 
 async function fetchMamoriUsers(api: any): Promise<any[]> {
-    const payload = buildUserSearchPayload('mamori_users');
     const mamoriUserFilters = getObjectFilters('mamori_users');
 
-    // Try search endpoints first so filters can be pushed down.
     if (mamoriUserFilters.length > 0) {
-        const candidateEndpoints = ["/v1/search/mamori_users", "/v1/search/users"];
-        for (const endpoint of candidateEndpoints) {
-            const result = await io_utils.noThrow(api.callAPI("PUT", endpoint, payload));
-            if (!result?.errors) {
-                let users = normalizeArrayResult(result);
-                users = users.filter((user: any) => shouldSyncObject('mamori_users', user.username || ''));
-                return users;
+        const literalUsernames: string[] = [];
+        for (const p of mamoriUserFilters) {
+            const u = literalMamoriUsernameForSearchFilter(p);
+            if (u != null) {
+                literalUsernames.push(u);
+            } else {
+                literalUsernames.length = 0;
+                break;
             }
         }
-    }
+        if (literalUsernames.length === mamoriUserFilters.length && literalUsernames.length > 0) {
+            const unique = literalUsernames.filter((username, index, arr) => arr.indexOf(username) === index);
+            const byName = new Map<string, any>();
+            logDebugAuth(
+                `fetchMamoriUsers: server-side filter — ${unique.length} User.list call(s) with ["username","=", ...]`,
+            );
+            for (const uname of unique) {
+                const result = await io_utils.noThrow(
+                    io_user.User.list(api, 0, 1000, [['username', '=', uname]]),
+                );
+                if (result?.errors) {
+                    logDebugAuth(`fetchMamoriUsers: User.list failed for ${uname}: ${stringifyApiPayload(result)}`);
+                    continue;
+                }
+                const chunk = normalizeArrayResult(result);
+                for (const row of chunk) {
+                    if (row?.username && !byName.has(row.username)) {
+                        byName.set(row.username, row);
+                    }
+                }
+            }
+            return Array.from(byName.values()).filter((user: any) =>
+                shouldSyncObject('mamori_users', user.username || ''),
+            );
+        }
+        logMain(
+            'Mamori users: object_filters are not all simple ^username$ entries; using User.list (no server filter) then client shouldSyncObject.',
+        );
+    } 
 
-    // Fallback path for older APIs that only expose SDK list.
     let users = normalizeArrayResult(await io_utils.noThrow(io_user.User.list(api, 0, 1000)));
     users = users.filter((user: any) => shouldSyncObject('mamori_users', user.username || ''));
     return users;
@@ -370,6 +427,45 @@ function normalizeUserDisabled(user: any): boolean | null {
         if (status === 'enabled' || status === 'active') return false;
     }
     return null;
+}
+
+/**
+ * Last-modify time from a mamori_users search/list row. Primary field is `modifydate` (ISO-8601 with offset, e.g.
+ * 2026-04-25T03:55:10.422+10:00 from the hub API). Fallback keys cover alternate endpoint shapes.
+ */
+function getMamoriUserModifyTimeMs(user: any): number | null {
+    if (!user || typeof user !== "object") {
+        return null;
+    }
+    const raw =
+        user.modifydate ?? user.modify_date ?? user.last_modified ?? user.updated_at;
+    if (raw == null || raw === "") {
+        return null;
+    }
+    if (typeof raw === "number") {
+        return raw < 1e12 ? raw * 1000 : raw;
+    }
+    const ms = Date.parse(String(raw));
+    return Number.isNaN(ms) ? null : ms;
+}
+
+/**
+ * True when the source user row is newer than the target by `modifydate`. If the target has no parseable
+ * time but the source does, treat as newer (align secrets onto target for the first time).
+ */
+function isSourceMamoriUserNewerByModifyDate(
+    source: any,
+    target: any,
+): { newer: boolean; sourceMs: number | null; targetMs: number | null } {
+    const sourceMs = getMamoriUserModifyTimeMs(source);
+    const targetMs = getMamoriUserModifyTimeMs(target);
+    if (sourceMs != null && targetMs != null) {
+        return { newer: sourceMs > targetMs, sourceMs, targetMs };
+    }
+    if (sourceMs != null && targetMs == null) {
+        return { newer: true, sourceMs, targetMs };
+    }
+    return { newer: false, sourceMs, targetMs };
 }
 
 /** Tab-separated auth providers from user search rows; used to detect MFA / provider drift vs target. */
@@ -1666,6 +1762,73 @@ async function activateMamoriUser(apiKC: any, username: string, traceId?: string
 }
 
 /**
+ * Export password/MFA on source, restore on target, without `user.update`. Used when the source account was
+ * modified after the target (by `modifydate`) but profile search fields already match.
+ * Mirrors the successful update path’s restore + reconcile behavior (not the create path’s activate-before-password).
+ */
+async function applyMamoriUserSecretSyncFromSource(
+    api: any,
+    apiKC: any,
+    r: any,
+    tempAESKey: { keyName: string },
+    syncMamoriMFA: boolean,
+    syncMamoriPassword: boolean,
+    traceId: string,
+): Promise<void> {
+    const trace = `[TRACE ${traceId}]`;
+    let mfaInfo: ExportedMFAInfo = { provider: "none", hasMFA: false, encryptedValue: null };
+    if (syncMamoriMFA) {
+        mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r, traceId);
+        if (mfaInfo.hasMFA) {
+            logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
+            if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for user ${r.username}`);
+            else logError(`Failed to export MFA options for user ${r.username}, continuing without MFA`);
+        }
+    }
+    let passwordBlob: string | null = null;
+    if (syncMamoriPassword) {
+        passwordBlob = await exportUserPasswordBlob(api, r.username, tempAESKey.keyName, traceId);
+    }
+    logDebugAuth(
+        `${trace} Mamori mdate secret sync ${r.username}: willRestorePassword=${!!(tempAESKey && syncMamoriPassword)} hasExportBlob=${!!passwordBlob} hasMfaExport=${mfaInfo.hasMFA && !!mfaInfo.encryptedValue}`,
+    );
+    await logMamoriUserApiRaw(apiKC, r.username, trace, "Mamori mdate secret-sync pre-restore target");
+    if (tempAESKey && syncMamoriPassword) {
+        let restored: boolean | null = null;
+        if (passwordBlob) {
+            restored = await restoreUserPasswordBlob(apiKC, r.username, passwordBlob, tempAESKey.keyName, traceId);
+            if (!restored) {
+                logError(`${trace} Password restore failed for ${r.username} (mdate secret sync)`);
+            }
+        } else {
+            logError(`${trace} Password restore skipped for ${r.username}: export payload missing (mdate secret sync)`);
+        }
+        logDebugAuth(
+            `${trace} Mamori mdate secret sync ${r.username} post-restore password: hadExportBlob=${!!passwordBlob} restoreOk=${restored === true ? "yes" : restored === false ? "no" : "not_attempted"}`,
+        );
+    } else {
+        logDebugAuth(
+            `${trace} Mamori mdate secret sync ${r.username}: no password restore (tempAESKey=${!!tempAESKey} syncMamoriPassword=${syncMamoriPassword})`,
+        );
+    }
+    if (tempAESKey && syncMamoriMFA) {
+        await restoreUserMFAIfAvailable(apiKC, r.username, mfaInfo.provider, tempAESKey.keyName, mfaInfo, "Mamori User", traceId);
+    }
+    await logSourceTargetUserOptionsComparison(api, apiKC, r.username, traceId, "mdate-secrets");
+    const refreshedTarget = (await fetchMamoriUsers(apiKC)).find((u: any) => u.username === r.username) || null;
+    const sourceDisabled = normalizeUserDisabled(r);
+    const targetDisabled = normalizeUserDisabled(refreshedTarget);
+    logMain(
+        `Post-mdate secret sync disabled reconcile inputs for ${r.username}: source=${sourceDisabled}, target=${targetDisabled}`,
+    );
+    await reconcileUserDisabledState(apiKC, "mamori", r.username, sourceDisabled, targetDisabled);
+    const afterReconcile = (await fetchMamoriUsers(apiKC)).find((u: any) => u.username === r.username) || null;
+    logMain(
+        `Post-mdate secret sync target state for ${r.username}: disabled=${normalizeUserDisabled(afterReconcile)}`,
+    );
+}
+
+/**
  * 1. Sync Mamori Users
  */
 async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
@@ -1716,12 +1879,15 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
             );
         }
         
+        console.log("!!!!!!!!!!! AI DEBUG MAMORI API- FECTCH USERS");
         let dataKJ = await fetchMamoriUsers(api);
         let dataKC = await fetchMamoriUsers(apiKC);
-        
+        console.log("AI DEBUG MAMORI DATA KC %o", dataKC);
         const targetByUsername = new Map<string, any>(dataKC.map((u: any) => [u.username, u]));
         const sourceByUsername = new Map<string, any>(dataKJ.map((u: any) => [u.username, u]));
         
+
+
         // Create new users
         let newItems = dataKJ.filter((user: any) => !targetByUsername.has(user.username));
         newItems = limitForTest(newItems);
@@ -1857,6 +2023,7 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 updatedItems.push(s);
             }
         }
+        const updatedUsernames = new Set<string>(updatedItems.map((u: any) => String(u?.username || "")));
         
         for (let r of updatedItems) {
             try {
@@ -1934,6 +2101,60 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
             } catch (error) {
                 logSyncAction("UPDATE", "Mamori User", r.username, "error", error.toString());
                 logError(`Failed to update Mamori user ${r.username}: ${error}`);
+            }
+        }
+        
+        // When profile rows match, `updatedItems` is empty, but the source may still be newer (e.g. password
+        // change only). Re-sync password/MFA when source `modifydate` is after the target's.
+        const mdateSecretItems: any[] = [];
+        if (tempAESKey && (syncMamoriPassword || syncMamoriMFA)) {
+            for (const s of dataKJ) {
+                if (!shouldSyncObject("mamori_users", s.username)) {
+                    continue;
+                }
+                
+                const t = targetByUsername.get(s.username);
+                if (!t) {
+                    continue;
+                }
+                if (updatedUsernames.has(s.username)) {
+                    continue;
+                }
+                console.log("!!!!88888 COMPARING MAMORI USER SOURCE %o %s", s.username,s.modifydate);
+                console.log("!!!!88888 COMPARING MAMORI USER TARGET %o %s", t.username,t.modifydate);
+                const { newer, sourceMs, targetMs } = isSourceMamoriUserNewerByModifyDate(s, t);
+                console.log("!!!!88888 COMPARING MAMORI USER NEWER %o %s", s.username,newer);
+                if (!newer) {
+                    continue;
+                }
+                mdateSecretItems.push(s);
+                logDebugAuth(
+                    `Mamori mdate-based secret sync candidate ${s.username}: sourceMs=${sourceMs} targetMs=${targetMs} (source newer)`,
+                );
+            }
+        }
+        logMain(
+            `Found ${mdateSecretItems.length} Mamori user(s) for modifydate-based password/MFA sync (source modifydate after target)`,
+        );
+
+        for (const r of mdateSecretItems) {
+            const traceId = `${Date.now()}-${r.username}-mamori-mdate-secrets`;
+            try {
+                logMain(
+                    `Mamori user modifydate secret sync: ${r.username} (source row newer than target; skip duplicate if already in profile update)`,
+                );
+                logMain(`[TRACE ${traceId}] Source mamori_users search/list row (raw): ${stringifyApiPayload(r)}`);
+                await applyMamoriUserSecretSyncFromSource(
+                    api,
+                    apiKC,
+                    r,
+                    tempAESKey!,
+                    syncMamoriMFA,
+                    syncMamoriPassword,
+                    traceId,
+                );
+            } catch (error) {
+                logError(`Mamori mdate secret sync failed for ${r.username}: ${error}`);
             }
         }
         
