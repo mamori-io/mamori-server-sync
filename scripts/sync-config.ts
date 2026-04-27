@@ -478,6 +478,26 @@ function normalizeUserProvidersString(user: any): string {
         .trim();
 }
 
+function listUserOptionNames(rows: any[]): string[] {
+    return rows
+        .map((row: any) => String(row?.option_name ?? row?.OPTION_NAME ?? "").toLowerCase().trim())
+        .filter((name: string) => !!name);
+}
+
+function deriveMfaProvidersFromUserRow(userRow: any): { providers: string[]; hasMFA: boolean; primary?: string; passwordProvider: string } {
+    const providersTab = normalizeUserProvidersString(userRow);
+    const passwordProvider = normalizeProviderName(String(userRow?.password_provider ?? "").trim());
+    const providers = Array.from(
+        new Set(
+            providersTab
+                .split("\t")
+                .map((p: string) => normalizeProviderName((p || "").replace(/\r/g, "").trim()))
+                .filter((p: string) => !!p && p !== "none" && p !== "password" && p !== passwordProvider),
+        ),
+    );
+    return { providers, hasMFA: providers.length > 0, primary: providers[0], passwordProvider };
+}
+
 /**
  * GET /v1/users/:name/options returns the JSON body of SELECT * FROM SYS.USER_OPTIONS — an array of
  * { username, option_name, option_value } rows — not a single object with authenticated_by_primary.
@@ -547,10 +567,10 @@ async function exportUserMFAIfPresent(
     traceId?: string,
 ): Promise<ExportedMFAInfo> {
     const mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
-    const providersHintTab = sourceUserRow ? normalizeUserProvidersString(sourceUserRow) : "";
-    const sourceMfaInfo = await getUserMFAProvider(api, username, providersHintTab);
+    const sourceMfaInfo = await getUserMFAProvider(api, username, sourceUserRow, traceId);
+    const providersHintTab = sourceMfaInfo.providersHintTab;
     logMain(
-        `[TRACE ${traceId || 'no-trace'}] MFA inference for ${username}: providersHint="${providersHintTab}", inferredProvider="${sourceMfaInfo.provider}", hasMFA=${sourceMfaInfo.hasMFA}`
+        `[TRACE ${traceId || 'no-trace'}] MFA inference for ${username}: providersHint="${providersHintTab}", inferredProvider="${sourceMfaInfo.provider}", hasMFA=${sourceMfaInfo.hasMFA}, providersDerivedProviders=${JSON.stringify(sourceMfaInfo.providersDerivedProviders)}, passwordProvider="${sourceMfaInfo.passwordProvider}", providersDerivedHasMFA=${sourceMfaInfo.providersDerivedHasMFA}, userOptionsObservedNames=${JSON.stringify(sourceMfaInfo.userOptionsObservedNames)}`
     );
     mfaInfo.provider = sourceMfaInfo.provider;
     mfaInfo.hasMFA = sourceMfaInfo.hasMFA;
@@ -1534,38 +1554,56 @@ async function syncDatasourceCredentials(api: any, apiKC: any, aesKeyName: strin
 }
 
 /**
- * Resolve MFA provider for export using:
- * 1) SYS.USER_OPTIONS rows (option_name → provider, e.g. secret_mobile_identifier → pushmobile)
- * 2) Tab-separated `providers` from the source user search row when options are empty or ambiguous
+ * Resolve MFA provider for export using providers-first precedence:
+ * 1) Source `providers` + `password_provider` determines if user has MFA and canonical provider.
+ * 2) SYS.USER_OPTIONS rows are observed for diagnostics only and must not flip hasMFA=true by themselves.
  */
 async function getUserMFAProvider(
     api: any,
     username: string,
-    providersHintTab?: string,
-): Promise<{ provider: string; hasMFA: boolean }> {
+    sourceUserRow?: any,
+    traceId?: string,
+): Promise<{
+    provider: string;
+    hasMFA: boolean;
+    providersHintTab: string;
+    providersDerivedProviders: string[];
+    passwordProvider: string;
+    providersDerivedHasMFA: boolean;
+    userOptionsObservedNames: string[];
+}> {
+    const providersHintTab = sourceUserRow ? normalizeUserProvidersString(sourceUserRow) : "";
+    const providersDerived = deriveMfaProvidersFromUserRow(sourceUserRow);
+    const baseResult = {
+        provider: providersDerived.primary || "none",
+        hasMFA: providersDerived.hasMFA,
+        providersHintTab,
+        providersDerivedProviders: providersDerived.providers,
+        passwordProvider: providersDerived.passwordProvider,
+        providersDerivedHasMFA: providersDerived.hasMFA,
+        userOptionsObservedNames: [] as string[],
+    };
     try {
         const userOptions = await io_utils.noThrow(api.user_options(username));
         if (userOptions.errors) {
-            return { provider: "none", hasMFA: false };
+            return baseResult;
         }
 
         const rows = extractUserOptionsRows(userOptions);
-        const fromRows = inferMfaFromUserOptionRows(rows, providersHintTab || "");
-        if (fromRows.hasMFA) {
-            return fromRows;
+        const inferredFromRows = inferMfaFromUserOptionRows(rows, providersHintTab || "");
+        const observedNames = listUserOptionNames(rows);
+        if (inferredFromRows.hasMFA && !providersDerived.hasMFA) {
+            logDetail(
+                `[TRACE ${traceId || "no-trace"}] MFA user_options hint ignored for ${username}: inferredProvider="${inferredFromRows.provider}", providersHint="${providersHintTab}", userOptionsObservedNames=${JSON.stringify(observedNames)}`,
+            );
         }
-
-        if (providersHintTab) {
-            const fromHint = inferMfaProviderFromProvidersTabString(providersHintTab);
-            if (fromHint.hasMFA) {
-                return fromHint;
-            }
-        }
-
-        return { provider: "none", hasMFA: false };
+        return {
+            ...baseResult,
+            userOptionsObservedNames: observedNames,
+        };
     } catch (error) {
         logDetail(`Failed to get MFA provider for user ${username}: ${error}`);
-        return { provider: "none", hasMFA: false };
+        return baseResult;
     }
 }
 

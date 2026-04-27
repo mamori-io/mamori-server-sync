@@ -33,7 +33,7 @@
   },
   "sync_actions": {
     "sync-mamori-user-password": 1,
-    "sync-mamori-user-mfa": 0,
+    "sync-mamori-user-mfa": 1,
     "sync-directory-user_mfa": 0
   },
   "provider_mappings": [
