@@ -62,6 +62,11 @@ if (!fs.existsSync(logDir)) {
 // Logging functions
 function logMain(message: string) {
     const timestamp = new Date().toISOString();
+    if (message.startsWith("[TRACE ")) {
+        // Keep verbose trace details out of the main sync log to reduce noise.
+        fs.appendFileSync(errorLogFile, `[${timestamp}] ${message}\n`);
+        return;
+    }
     const logLine = `[${timestamp}] ${message}`;
     console.log(logLine);
     fs.appendFileSync(mainLogFile, logLine + '\n');
@@ -116,9 +121,36 @@ function redactPasswordApiPayloadForLog(obj: any, depth = 0): any {
         if (typeof o.value === "string" && o.value.length > 0) {
             o.value = `<redacted, ${o.value.length} chars>`;
         }
+        if (typeof o.password === "string" && o.password.length > 0) {
+            o.password = `<redacted, ${o.password.length} chars>`;
+        }
+        if (typeof o.option_value === "string" && o.option_value.length > 0) {
+            o.option_value = `<redacted, ${o.option_value.length} chars>`;
+        }
         return o;
     }
     return obj;
+}
+
+function formatServerErrorForLog(result: any): string {
+    if (!result) return "Unknown error";
+    const baseMsg = String(result?.message || "Unknown error");
+    const responseData = result?.response?.data;
+    if (responseData && typeof responseData === "object") {
+        const serverMsg = responseData?.message ? String(responseData.message).trim() : "";
+        const sqlState = responseData?.sqlState ? String(responseData.sqlState) : "";
+        const parts = [baseMsg];
+        if (serverMsg) parts.push(`server_message=${serverMsg}`);
+        if (sqlState) parts.push(`sqlState=${sqlState}`);
+        return parts.join(" | ");
+    }
+    return baseMsg;
+}
+
+function logServerErrorPayload(context: string, result: any): void {
+    if (!result) return;
+    const payload = redactPasswordApiPayloadForLog(result);
+    logError(`${context}: ${stringifyApiPayload(payload)}`);
 }
 
 /** If SYNC_DEBUG_AUTH=1, logs to main and error log with [auth-debug] prefix. Never log raw passwords or blobs. */
@@ -128,6 +160,25 @@ function logDebugAuth(message: string) {
     logMain(line);
     const ts = new Date().toISOString();
     fs.appendFileSync(errorLogFile, `[${ts}] ${line}\n`);
+}
+
+function emitDatasourceDebugLog(
+    runId: string,
+    hypothesisId: string,
+    location: string,
+    message: string,
+    data: any
+): void {
+    let compact = "";
+    try {
+        compact = JSON.stringify(data);
+    } catch {
+        compact = String(data);
+    }
+    logMain(`[DBTRACE][${hypothesisId}] ${location} | ${message} | ${compact}`);
+    // #region agent log
+    fetch('http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f538ee'},body:JSON.stringify({sessionId:'f538ee',runId,hypothesisId,location,message,data,timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
 }
 
 // Load sync configuration
@@ -385,11 +436,38 @@ function normalizeArrayResult(result: any): any[] {
     return [];
 }
 
+const MFA_PUSHMOBILE = "pushmobile";
+
 type ExportedMFAInfo = {
+    /** First export-restorable provider (e.g. pushtotp) for EXPORT/RESTORE; "none" if none. */
     provider: string;
     hasMFA: boolean;
     encryptedValue: string | null;
+    /** Same as `provider` when an export/restore was intended; kept for clarity. */
+    exportProvider: string;
+    serverBoundProviders: string[];
+    sourceHasPushmobile: boolean;
 };
+
+function emptyExportedMfaInfo(): ExportedMFAInfo {
+    return {
+        provider: "none",
+        hasMFA: false,
+        encryptedValue: null,
+        exportProvider: "none",
+        serverBoundProviders: [],
+        sourceHasPushmobile: false,
+    };
+}
+
+function isServerBoundMfaProvider(p: string): boolean {
+    return normalizeProviderName(p) === MFA_PUSHMOBILE;
+}
+
+function isExportRestorableMfaProvider(p: string): boolean {
+    const n = normalizeProviderName(p);
+    return n === "pushtotp" || n === "totp";
+}
 
 type RestoreMFAResult = {
     success: boolean;
@@ -484,18 +562,34 @@ function listUserOptionNames(rows: any[]): string[] {
         .filter((name: string) => !!name);
 }
 
+/**
+ * Non-password / non-duplicate MFA tokens from `providers` (tab order preserved; first wins per normalized name).
+ */
 function deriveMfaProvidersFromUserRow(userRow: any): { providers: string[]; hasMFA: boolean; primary?: string; passwordProvider: string } {
     const providersTab = normalizeUserProvidersString(userRow);
     const passwordProvider = normalizeProviderName(String(userRow?.password_provider ?? "").trim());
-    const providers = Array.from(
-        new Set(
-            providersTab
-                .split("\t")
-                .map((p: string) => normalizeProviderName((p || "").replace(/\r/g, "").trim()))
-                .filter((p: string) => !!p && p !== "none" && p !== "password" && p !== passwordProvider),
-        ),
-    );
+    const seen = new Set<string>();
+    const providers: string[] = [];
+    for (const part of providersTab.split("\t")) {
+        const p = normalizeProviderName((part || "").replace(/\r/g, "").trim());
+        if (!p || p === "none" || p === "password" || p === passwordProvider) {
+            continue;
+        }
+        if (seen.has(p)) {
+            continue;
+        }
+        seen.add(p);
+        providers.push(p);
+    }
     return { providers, hasMFA: providers.length > 0, primary: providers[0], passwordProvider };
+}
+
+function userRowHasMfaToken(userRow: any, token: string): boolean {
+    if (!userRow || typeof userRow !== "object") {
+        return false;
+    }
+    const want = normalizeProviderName(token);
+    return deriveMfaProvidersFromUserRow(userRow).providers.some((p) => p === want);
 }
 
 /**
@@ -566,27 +660,46 @@ async function exportUserMFAIfPresent(
     sourceUserRow?: any,
     traceId?: string,
 ): Promise<ExportedMFAInfo> {
-    const mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
+    const mfaInfo: ExportedMFAInfo = emptyExportedMfaInfo();
     const sourceMfaInfo = await getUserMFAProvider(api, username, sourceUserRow, traceId);
     const providersHintTab = sourceMfaInfo.providersHintTab;
-    logMain(
-        `[TRACE ${traceId || 'no-trace'}] MFA inference for ${username}: providersHint="${providersHintTab}", inferredProvider="${sourceMfaInfo.provider}", hasMFA=${sourceMfaInfo.hasMFA}, providersDerivedProviders=${JSON.stringify(sourceMfaInfo.providersDerivedProviders)}, passwordProvider="${sourceMfaInfo.passwordProvider}", providersDerivedHasMFA=${sourceMfaInfo.providersDerivedHasMFA}, userOptionsObservedNames=${JSON.stringify(sourceMfaInfo.userOptionsObservedNames)}`
-    );
-    mfaInfo.provider = sourceMfaInfo.provider;
+    const ordered = sourceMfaInfo.providersDerivedProviders;
+    const serverBound = ordered.filter((p) => isServerBoundMfaProvider(p));
+    const exportProvider =
+        sourceMfaInfo.provider && sourceMfaInfo.provider !== "none" ? sourceMfaInfo.provider : "none";
     mfaInfo.hasMFA = sourceMfaInfo.hasMFA;
+    mfaInfo.serverBoundProviders = serverBound;
+    mfaInfo.sourceHasPushmobile = userRowHasMfaToken(sourceUserRow, MFA_PUSHMOBILE);
+    mfaInfo.exportProvider = exportProvider;
+    mfaInfo.provider = exportProvider;
+    logMain(
+        `[TRACE ${traceId || "no-trace"}] MFA inference for ${username}: providersHint="${providersHintTab}", exportProvider="${exportProvider}", hasMFA=${sourceMfaInfo.hasMFA}, serverBoundProviders=${JSON.stringify(serverBound)}, sourceHasPushmobile=${mfaInfo.sourceHasPushmobile}, providersDerivedProviders=${JSON.stringify(sourceMfaInfo.providersDerivedProviders)}, passwordProvider="${sourceMfaInfo.passwordProvider}", providersDerivedHasMFA=${sourceMfaInfo.providersDerivedHasMFA}, userOptionsObservedNames=${JSON.stringify(sourceMfaInfo.userOptionsObservedNames)}`
+    );
     if (!mfaInfo.hasMFA) {
-        logMain(`[TRACE ${traceId || 'no-trace'}] MFA export skipped for ${username}: inferred hasMFA=false`);
+        logMain(`[TRACE ${traceId || "no-trace"}] MFA export skipped for ${username}: inferred hasMFA=false`);
         return mfaInfo;
     }
-    const encryptedValue = await exportUserMFAOptions(api, username, mfaInfo.provider, aesKeyName, traceId);
+    if (exportProvider === "none" || !isExportRestorableMfaProvider(exportProvider)) {
+        if (serverBound.length > 0) {
+            logMain(
+                `[TRACE ${traceId || "no-trace"}] MFA: server-bound only (${JSON.stringify(
+                    serverBound,
+                )}); skipping EXPORT_USER_AUTH_PROVIDER_OPTIONS_EX (not portable for e.g. pushmobile) for ${username}`,
+            );
+        } else {
+            logMain(`[TRACE ${traceId || "no-trace"}] MFA export skipped for ${username}: no restorable provider in providers list`);
+        }
+        return mfaInfo;
+    }
+    const encryptedValue = await exportUserMFAOptions(api, username, exportProvider, aesKeyName, traceId);
     if (encryptedValue) {
         mfaInfo.encryptedValue = encryptedValue;
         logMain(
-            `[TRACE ${traceId || 'no-trace'}] MFA export payload captured for ${username}: provider=${mfaInfo.provider}, payloadLength=${encryptedValue.length}`
+            `[TRACE ${traceId || "no-trace"}] MFA export payload captured for ${username}: provider=${exportProvider}, payloadLength=${encryptedValue.length}`,
         );
     } else {
         logError(
-            `[TRACE ${traceId || 'no-trace'}] MFA export returned no payload for ${username}: provider=${mfaInfo.provider}, providersHint="${providersHintTab}"`
+            `[TRACE ${traceId || "no-trace"}] MFA export returned no payload for ${username}: provider=${exportProvider}, providersHint="${providersHintTab}"`,
         );
     }
     return mfaInfo;
@@ -644,46 +757,179 @@ async function logSourceTargetUserOptionsComparison(
     }
 }
 
-async function restoreUserMFAIfAvailable(
+/**
+ * `RESTORE_USER_AUTH_PROVIDER_OPTIONS_EX` for exportable providers (e.g. pushtotp) only. Ignores server-bound (pushmobile).
+ */
+async function restoreUserMfaExportBlob(
     apiKC: any,
     username: string,
-    targetProvider: string,
     aesKeyName: string,
     mfaInfo: ExportedMFAInfo,
     userTypeLabel: string,
     traceId?: string,
 ): Promise<void> {
-    const tracePrefix = `[TRACE ${traceId || 'no-trace'}]`;
-    await logMamoriUserApiRaw(apiKC, username, tracePrefix, `Pre-restore target (${userTypeLabel})`);
-    if (!mfaInfo.hasMFA) {
-        logDetail(`${userTypeLabel} ${username} has no MFA provider to sync`);
-        logMain(`${tracePrefix} Restore skipped: mfaInfo.hasMFA=false`);
-        return;
-    }
+    const tracePrefix = `[TRACE ${traceId || "no-trace"}]`;
     if (!mfaInfo.encryptedValue) {
-        logError(`Skipping MFA restore for ${userTypeLabel.toLowerCase()} ${username}: no exported MFA payload available`);
-        logMain(`${tracePrefix} Restore skipped: encrypted MFA payload missing`);
         return;
     }
-    const normalizedTargetProvider = normalizeProviderName(targetProvider || '');
-    if (!normalizedTargetProvider || normalizedTargetProvider === 'none' || normalizedTargetProvider === 'password') {
-        logError(`Skipping MFA restore for ${userTypeLabel.toLowerCase()} ${username}: invalid target provider "${targetProvider}"`);
-        logMain(`${tracePrefix} Restore skipped: invalid normalized target provider "${normalizedTargetProvider}"`);
+    const exportProv =
+        mfaInfo.exportProvider && mfaInfo.exportProvider !== "none" ? mfaInfo.exportProvider : mfaInfo.provider;
+    if (!isExportRestorableMfaProvider(exportProv)) {
+        logMain(
+            `${tracePrefix} RESTORE skip blob for ${userTypeLabel} ${username}: exportProvider="${exportProv}" is not an export-restore type`,
+        );
         return;
     }
+    const normalizedTargetProvider = normalizeProviderName(exportProv);
+    if (!normalizedTargetProvider || normalizedTargetProvider === "none" || normalizedTargetProvider === "password") {
+        logError(`Skipping MFA restore for ${userTypeLabel.toLowerCase()} ${username}: invalid provider "${exportProv}"`);
+        return;
+    }
+    await logMamoriUserApiRaw(apiKC, username, tracePrefix, `Pre-restore target (${userTypeLabel})`);
     logMain(
-        `${tracePrefix} Restore call input (${userTypeLabel} ${username}): provider=${normalizedTargetProvider}, payloadLength=${mfaInfo.encryptedValue.length}, aesKey=${aesKeyName}`
+        `${tracePrefix} Restore call input (${userTypeLabel} ${username}): provider=${normalizedTargetProvider}, payloadLength=${mfaInfo.encryptedValue.length}, aesKey=${aesKeyName}`,
     );
     logDetail(`Restoring MFA options for ${userTypeLabel.toLowerCase()} ${username} using provider: ${normalizedTargetProvider}`);
     const restoreResult = await restoreUserMFAOptions(apiKC, username, normalizedTargetProvider, mfaInfo.encryptedValue, aesKeyName, traceId);
     await logMamoriUserApiRaw(apiKC, username, tracePrefix, `Post-restore target (${userTypeLabel})`);
-    logMain(`${tracePrefix} RESTORE_USER_AUTH_PROVIDER_OPTIONS_EX API response (${userTypeLabel} ${username}): ${stringifyApiPayload(restoreResult.rawResult)}`);
-    const restoreSuccess = restoreResult.success;
-    if (restoreSuccess) {
+    logMain(
+        `${tracePrefix} RESTORE_USER_AUTH_PROVIDER_OPTIONS_EX API response (${userTypeLabel} ${username}): ${stringifyApiPayload(restoreResult.rawResult)}`,
+    );
+    if (restoreResult.success) {
         logMain(`✅ Restored MFA options for ${userTypeLabel.toLowerCase()} ${username}`);
     } else {
         logError(`Failed to restore MFA options for ${userTypeLabel.toLowerCase()} ${username}`);
     }
+}
+
+/**
+ * Enable pushmobile on the target only when source has it and target does not; enrollment (QR) is per-server, not copyable.
+ */
+async function tryEnablePushMobileMfa(
+    apiKC: any,
+    sourceUserRow: any,
+    getTargetUserRow: () => Promise<any | null>,
+    mfaInfo: ExportedMFAInfo,
+    userTypeLabel: string,
+    traceId?: string,
+): Promise<void> {
+    const tracePrefix = `[TRACE ${traceId || "no-trace"}]`;
+    const uname = sourceUserRow?.username;
+    if (!mfaInfo.hasMFA || !mfaInfo.sourceHasPushmobile) {
+        return;
+    }
+    if (!userRowHasMfaToken(sourceUserRow, MFA_PUSHMOBILE)) {
+        return;
+    }
+    const target = await getTargetUserRow();
+    if (target && userRowHasMfaToken(target, MFA_PUSHMOBILE)) {
+        logMain(
+            `${tracePrefix} ${userTypeLabel} ${uname}: target already has pushmobile MFA; no enable (idempotent)`,
+        );
+        return;
+    }
+    if (!target) {
+        logError(
+            `${tracePrefix} ${userTypeLabel} ${uname}: cannot enable pushmobile (target user row not found)`,
+        );
+        return;
+    }
+    const u = new io_user.User(String(uname));
+    const res = await io_utils.noThrow(u.setMFAProvider(apiKC, MFA_PUSHMOBILE));
+    if (res?.errors) {
+        logError(
+            `${tracePrefix} setMFAProvider(pushmobile) failed for ${userTypeLabel} ${uname}: ${stringifyApiPayload(res)}`,
+        );
+    } else {
+        logMain(
+            `${tracePrefix} Enabled pushmobile MFA on target for ${userTypeLabel} ${uname} (user enrolls e.g. QR on next login to this server)`,
+        );
+    }
+}
+
+/**
+ * After Mamori user create or update: restore exportable MFA blob, then enable pushmobile if required by plan rules.
+ */
+async function applyMamoriMfaToTarget(
+    apiKC: any,
+    sourceUserRow: any,
+    mfaInfo: ExportedMFAInfo,
+    aesKeyName: string,
+    traceId?: string,
+): Promise<void> {
+    const uname = sourceUserRow?.username;
+    const tracePrefix = `[TRACE ${traceId || "no-trace"}]`;
+    if (!mfaInfo.hasMFA) {
+        logMain(`${tracePrefix} applyMamoriMfaToTarget: no MFA on source, skip for ${uname}`);
+        return;
+    }
+    if (mfaInfo.encryptedValue) {
+        await restoreUserMfaExportBlob(apiKC, uname, aesKeyName, mfaInfo, "Mamori User", traceId);
+    } else if (
+        mfaInfo.exportProvider &&
+        mfaInfo.exportProvider !== "none" &&
+        isExportRestorableMfaProvider(mfaInfo.exportProvider)
+    ) {
+        logError(
+            `${tracePrefix} Mamori user ${uname}: expected MFA export payload for ${mfaInfo.exportProvider} was missing; skipping blob restore`,
+        );
+    }
+    await tryEnablePushMobileMfa(
+        apiKC,
+        sourceUserRow,
+        async () => {
+            const users = await fetchMamoriUsers(apiKC);
+            return users.find((u: any) => u?.username === uname) ?? null;
+        },
+        mfaInfo,
+        "Mamori User",
+        traceId,
+    );
+}
+
+/**
+ * Directory-linked users: restore exportable MFA if present, then enable pushmobile on target by plan rules.
+ */
+async function applyDirectoryMfaToTarget(
+    apiKC: any,
+    sourceDirRow: any,
+    mfaInfo: ExportedMFAInfo,
+    mappedTargetProvider: string,
+    aesKeyName: string,
+    traceId?: string,
+): Promise<void> {
+    const un = sourceDirRow?.username;
+    if (!mfaInfo.hasMFA) {
+        return;
+    }
+    if (mfaInfo.encryptedValue) {
+        await restoreUserMfaExportBlob(apiKC, un, aesKeyName, mfaInfo, "Directory User", traceId);
+    } else if (
+        mfaInfo.exportProvider &&
+        mfaInfo.exportProvider !== "none" &&
+        isExportRestorableMfaProvider(mfaInfo.exportProvider)
+    ) {
+        logError(
+            `[TRACE ${traceId || "no-trace"}] Directory user ${un}: expected MFA export payload for ${mfaInfo.exportProvider} was missing; skipping blob restore`,
+        );
+    }
+    const normT = normalizeProviderName(mappedTargetProvider);
+    await tryEnablePushMobileMfa(
+        apiKC,
+        sourceDirRow,
+        async () => {
+            const data = await fetchDirectoryUsers(apiKC);
+            return (
+                data.find(
+                    (u: any) =>
+                        u?.username === un && normalizeProviderName(String(u?.provider || "")) === normT,
+                ) ?? null
+            );
+        },
+        mfaInfo,
+        "Directory User",
+        traceId,
+    );
 }
 
 function isSuccessfulResult(result: any): boolean {
@@ -764,6 +1010,13 @@ async function getFilteredDatasourceNames(api: any, apiKC?: any): Promise<string
 
     const sourceResult = await io_utils.noThrow(io_datasource.Datasource.getAll(api));
     const sourceItems = normalizeArrayResult(sourceResult);
+    emitDatasourceDebugLog(
+        "pre-fix",
+        "H1",
+        "scripts/sync-config.ts:getFilteredDatasourceNames:source",
+        "Datasource source list fetched before filter",
+        { fetchedCount: Array.isArray(sourceItems) ? sourceItems.length : -1 }
+    );
     sourceItems.forEach((ds: any) => {
         const name = ds?.name || '';
         if (name && shouldSyncObject('datasources', name)) {
@@ -774,6 +1027,13 @@ async function getFilteredDatasourceNames(api: any, apiKC?: any): Promise<string
     if (apiKC) {
         const targetResult = await io_utils.noThrow(io_datasource.Datasource.getAll(apiKC));
         const targetItems = normalizeArrayResult(targetResult);
+        emitDatasourceDebugLog(
+            "pre-fix",
+            "H1",
+            "scripts/sync-config.ts:getFilteredDatasourceNames:target",
+            "Datasource target list fetched before filter",
+            { fetchedCount: Array.isArray(targetItems) ? targetItems.length : -1 }
+        );
         targetItems.forEach((ds: any) => {
             const name = ds?.name || '';
             if (name && shouldSyncObject('datasources', name)) {
@@ -782,7 +1042,15 @@ async function getFilteredDatasourceNames(api: any, apiKC?: any): Promise<string
         });
     }
 
-    return Array.from(names);
+    const filtered = Array.from(names);
+    emitDatasourceDebugLog(
+        "pre-fix",
+        "H1",
+        "scripts/sync-config.ts:getFilteredDatasourceNames:return",
+        "Datasource names after filter union",
+        { filteredCount: filtered.length, filteredNames: filtered }
+    );
+    return filtered;
 }
 
 async function listDatasourceCredentialsForDatasources(
@@ -1311,8 +1579,15 @@ async function syncDatasources(api: any, apiKC: any): Promise<void> {
 
         // CREATE
         let newItems = arrayDiff(true, dataKJ, dataKC, compareFunc);
-        newItems = limitForTest(newItems);
         newItems = newItems.filter((ds: any) => shouldSyncObject('datasources', dsName(ds)));
+        newItems = limitForTest(newItems);
+        emitDatasourceDebugLog(
+            "pre-fix",
+            "H2",
+            "scripts/sync-config.ts:syncDatasources:new-items",
+            "Datasource NEW detection completed",
+            { count: newItems.length, names: newItems.map((ds: any) => dsName(ds)) }
+        );
         logMain(`Found ${newItems.length} Datasources to create`);
 
         for (let r of newItems) {
@@ -1323,15 +1598,69 @@ async function syncDatasources(api: any, apiKC: any): Promise<void> {
                     logSyncAction("CREATE", "Datasource", r.name, "error", msg);
                     continue;
                 }
+                // Read full systems list from source and pass-through matched system payload.
+                // This keeps us aligned with server API shape used by /api/v1/systems create.
+                const sourceSystemsRes = await io_utils.noThrow(api.callAPI("GET", "/v1/systems"));
+                if (sourceSystemsRes?.errors || !sourceSystemsRes) {
+                    const msg = sourceSystemsRes?.message || "Failed to list source datasource systems";
+                    logSyncAction("CREATE", "Datasource", r.name, "error", msg);
+                    continue;
+                }
 
-                let createDs = io_datasource.Datasource.build(sourceDs);
-                let res = await io_utils.noThrow(createDs.create(apiKC));
+                const systemRows = Array.isArray(sourceSystemsRes)
+                    ? sourceSystemsRes
+                    : Array.isArray(sourceSystemsRes?.data)
+                        ? sourceSystemsRes.data
+                        : Array.isArray(sourceSystemsRes?.systems)
+                            ? sourceSystemsRes.systems
+                            : [];
+                const matchedRow = systemRows.find((row: any) => {
+                    const rowName = row?.system?.name || row?.name || row?.systemname || "";
+                    return rowName === r.name;
+                });
+                const sourceSystem = matchedRow?.system || matchedRow || null;
+                if (!sourceSystem || typeof sourceSystem !== "object") {
+                    logSyncAction("CREATE", "Datasource", r.name, "error", "Source datasource system not found in /api/v1/systems");
+                    continue;
+                }
+
+                const createPayload = {
+                    preview: "N",
+                    system: sourceSystem,
+                    options: [""],
+                    authorizations: [] as any[],
+                };
+                emitDatasourceDebugLog(
+                    "pre-fix",
+                    "H4",
+                    "scripts/sync-config.ts:syncDatasources:create-send",
+                    "Datasource create payload about to be sent",
+                    {
+                        datasource: r.name,
+                        sourceReadKeys: Object.keys(sourceDs || {}),
+                        sourceSystemsRowKeys: Object.keys(matchedRow || {}),
+                        sourceSystemKeys: Object.keys(sourceSystem || {}),
+                        payloadSystemKeys: Object.keys(createPayload.system || {}),
+                        payloadSystemType: (createPayload.system as any)?.type ?? null,
+                        payloadSystemHost: (createPayload.system as any)?.host ?? null,
+                    }
+                );
+                let res = await io_utils.noThrow(apiKC.callAPI("POST", "/v1/systems", createPayload));
+                emitDatasourceDebugLog(
+                    "pre-fix",
+                    "H4",
+                    "scripts/sync-config.ts:syncDatasources:create-result",
+                    "Datasource create API returned",
+                    { datasource: r.name, hasErrors: !!res?.errors, message: res?.message || "", resultType: typeof res }
+                );
                 if (res?.errors) {
-                    logSyncAction("CREATE", "Datasource", r.name, "error", res.message || "Unknown error");
+                    logServerErrorPayload(`Datasource CREATE raw error payload (${r.name})`, res);
+                    logSyncAction("CREATE", "Datasource", r.name, "error", formatServerErrorForLog(res));
                 } else {
                     logSyncAction("CREATE", "Datasource", r.name, "success");
                 }
             } catch (error) {
+                logServerErrorPayload(`Datasource CREATE exception payload (${r.name})`, error);
                 logSyncAction("CREATE", "Datasource", r.name, "error", error.toString());
             }
         }
@@ -1350,6 +1679,13 @@ async function syncDatasources(api: any, apiKC: any): Promise<void> {
                         delete targetComparable.id;
 
                         if (JSON.stringify(sourceComparable) !== JSON.stringify(targetComparable)) {
+                            emitDatasourceDebugLog(
+                                "pre-fix",
+                                "H3",
+                                "scripts/sync-config.ts:syncDatasources:update-detect",
+                                "Datasource marked as modified",
+                                { datasource: s.name }
+                            );
                             updatedItems.push(sourceDs);
                         }
                     }
@@ -1358,8 +1694,15 @@ async function syncDatasources(api: any, apiKC: any): Promise<void> {
             }
         }
 
-        updatedItems = limitForTest(updatedItems);
         updatedItems = updatedItems.filter((ds: any) => shouldSyncObject('datasources', dsName(ds)));
+        updatedItems = limitForTest(updatedItems);
+        emitDatasourceDebugLog(
+            "pre-fix",
+            "H3",
+            "scripts/sync-config.ts:syncDatasources:updated-items",
+            "Datasource UPDATE detection completed",
+            { count: updatedItems.length, names: updatedItems.map((ds: any) => dsName(ds)) }
+        );
         logMain(`Found ${updatedItems.length} Datasources to update`);
 
         for (let r of updatedItems) {
@@ -1375,7 +1718,8 @@ async function syncDatasources(api: any, apiKC: any): Promise<void> {
                 let updateDs = io_datasource.Datasource.build(targetDs);
                 let res = await io_utils.noThrow(updateDs.update(apiKC, sourceDs));
                 if (res?.errors) {
-                    logSyncAction("UPDATE", "Datasource", r.name, "error", res.message || "Unknown error");
+                    logServerErrorPayload(`Datasource UPDATE raw error payload (${r.name})`, res);
+                    logSyncAction("UPDATE", "Datasource", r.name, "error", formatServerErrorForLog(res));
                 } else {
                     logSyncAction("UPDATE", "Datasource", r.name, "success");
                 }
@@ -1387,8 +1731,15 @@ async function syncDatasources(api: any, apiKC: any): Promise<void> {
         // DELETE
         if (shouldDeleteRemoved()) {
             let deletedItems = arrayDiff(true, dataKC, dataKJ, compareFunc);
-            deletedItems = limitForTest(deletedItems);
             deletedItems = deletedItems.filter((ds: any) => shouldSyncObject('datasources', dsName(ds)));
+            deletedItems = limitForTest(deletedItems);
+            emitDatasourceDebugLog(
+                "pre-fix",
+                "H2",
+                "scripts/sync-config.ts:syncDatasources:deleted-items",
+                "Datasource DELETE detection completed",
+                { count: deletedItems.length, names: deletedItems.map((ds: any) => dsName(ds)) }
+            );
             logMain(`Found ${deletedItems.length} Datasources to delete`);
 
             for (let r of deletedItems) {
@@ -1403,7 +1754,8 @@ async function syncDatasources(api: any, apiKC: any): Promise<void> {
                     let deleteDs = io_datasource.Datasource.build(targetDs);
                     let res = await io_utils.noThrow(deleteDs.delete(apiKC));
                     if (res?.errors) {
-                        logSyncAction("DELETE", "Datasource", r.name, "error", res.message || "Unknown error");
+                        logServerErrorPayload(`Datasource DELETE raw error payload (${r.name})`, res);
+                        logSyncAction("DELETE", "Datasource", r.name, "error", formatServerErrorForLog(res));
                     } else {
                         logSyncAction("DELETE", "Datasource", r.name, "success");
                     }
@@ -1440,16 +1792,42 @@ async function syncDatasourceCredentials(api: any, apiKC: any, aesKeyName: strin
     try {
         logMain("Starting Datasource Credentials synchronization...");
         const datasourceNames = await getFilteredDatasourceNames(api, apiKC);
+        emitDatasourceDebugLog(
+            "pre-fix",
+            "H1",
+            "scripts/sync-config.ts:syncDatasourceCredentials:datasource-filter",
+            "Datasource names used to fetch credentials",
+            { datasourceCount: datasourceNames.length, datasourceNames }
+        );
         let dataKJ = await listDatasourceCredentialsForDatasources(api, datasourceNames, true);
         let dataKC = await listDatasourceCredentialsForDatasources(apiKC, datasourceNames, false);
         dataKJ = dataKJ.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
         dataKC = dataKC.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
+        emitDatasourceDebugLog(
+            "pre-fix",
+            "H5",
+            "scripts/sync-config.ts:syncDatasourceCredentials:post-filter",
+            "Credential rows after datasource+credential filters",
+            {
+                sourceCount: dataKJ.length,
+                targetCount: dataKC.length,
+                sourceKeys: dataKJ.map((c: any) => credentialKey(c)),
+                targetKeys: dataKC.map((c: any) => credentialKey(c))
+            }
+        );
         let compareFunc = (s: any, t: any) => credentialKey(s) === credentialKey(t);
 
         // CREATE
         let newItems = arrayDiff(true, dataKJ, dataKC, compareFunc);
         newItems = limitForTest(newItems);
         newItems = newItems.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
+        emitDatasourceDebugLog(
+            "pre-fix",
+            "H2",
+            "scripts/sync-config.ts:syncDatasourceCredentials:new-items",
+            "Datasource credential NEW detection completed",
+            { count: newItems.length, keys: newItems.map((c: any) => credentialKey(c)) }
+        );
         logMain(`Found ${newItems.length} Datasource Credentials to create`);
 
         for (let r of newItems) {
@@ -1457,15 +1835,41 @@ async function syncDatasourceCredentials(api: any, apiKC: any, aesKeyName: strin
                 let sourceCred = io_db_credential.DBCredential.build(r);
                 let exportedPassword = await io_utils.noThrow(sourceCred.exportPassword(api, aesKeyName));
                 if (!exportedPassword || exportedPassword?.errors) {
-                    let msg = exportedPassword?.message || "Failed to export source credential password";
+                    if (exportedPassword?.errors) {
+                        logServerErrorPayload(`Datasource Credential CREATE exportPassword raw error payload (${credentialKey(r)})`, exportedPassword);
+                    }
+                    let msg = exportedPassword?.errors
+                        ? formatServerErrorForLog(exportedPassword)
+                        : "Failed to export source credential password";
                     logSyncAction("CREATE", "Datasource Credential", credentialKey(r), "error", msg);
                     continue;
                 }
 
                 sourceCred.password = exportedPassword;
+                emitDatasourceDebugLog(
+                    "pre-fix",
+                    "H4",
+                    "scripts/sync-config.ts:syncDatasourceCredentials:create-send",
+                    "Datasource credential create payload about to be sent",
+                    {
+                        key: credentialKey(r),
+                        datasource: r.systemname || r.datasource || "",
+                        accessname: r.accessname || "",
+                        grantee: r.grantee || "",
+                        hasExportedPassword: !!exportedPassword
+                    }
+                );
                 let res = await io_utils.noThrow(sourceCred.restore(apiKC, aesKeyName));
+                emitDatasourceDebugLog(
+                    "pre-fix",
+                    "H4",
+                    "scripts/sync-config.ts:syncDatasourceCredentials:create-result",
+                    "Datasource credential create API returned",
+                    { key: credentialKey(r), hasErrors: !!res?.errors, message: res?.message || "", resultType: typeof res }
+                );
                 if (res?.errors) {
-                    logSyncAction("CREATE", "Datasource Credential", credentialKey(r), "error", res.message || "Unknown error");
+                    logServerErrorPayload(`Datasource Credential CREATE restore raw error payload (${credentialKey(r)})`, res);
+                    logSyncAction("CREATE", "Datasource Credential", credentialKey(r), "error", formatServerErrorForLog(res));
                 } else {
                     logSyncAction("CREATE", "Datasource Credential", credentialKey(r), "success");
                 }
@@ -1490,6 +1894,17 @@ async function syncDatasourceCredentials(api: any, apiKC: any, aesKeyName: strin
 
                     if (sourceEncrypted !== targetEncrypted ||
                         (sourceCred.credential_reset_days || "") !== (targetCred.credential_reset_days || "")) {
+                        emitDatasourceDebugLog(
+                            "pre-fix",
+                            "H3",
+                            "scripts/sync-config.ts:syncDatasourceCredentials:update-detect",
+                            "Datasource credential marked as modified",
+                            {
+                                key: credentialKey(s),
+                                passwordDiff: sourceEncrypted !== targetEncrypted,
+                                resetDaysDiff: (sourceCred.credential_reset_days || "") !== (targetCred.credential_reset_days || "")
+                            }
+                        );
                         updatedItems.push(s);
                     }
                     break;
@@ -1499,6 +1914,13 @@ async function syncDatasourceCredentials(api: any, apiKC: any, aesKeyName: strin
 
         updatedItems = limitForTest(updatedItems);
         updatedItems = updatedItems.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
+        emitDatasourceDebugLog(
+            "pre-fix",
+            "H3",
+            "scripts/sync-config.ts:syncDatasourceCredentials:updated-items",
+            "Datasource credential UPDATE detection completed",
+            { count: updatedItems.length, keys: updatedItems.map((c: any) => credentialKey(c)) }
+        );
         logMain(`Found ${updatedItems.length} Datasource Credentials to update`);
 
         for (let r of updatedItems) {
@@ -1506,7 +1928,12 @@ async function syncDatasourceCredentials(api: any, apiKC: any, aesKeyName: strin
                 let sourceCred = io_db_credential.DBCredential.build(r);
                 let exportedPassword = await io_utils.noThrow(sourceCred.exportPassword(api, aesKeyName));
                 if (!exportedPassword || exportedPassword?.errors) {
-                    let msg = exportedPassword?.message || "Failed to export source credential password";
+                    if (exportedPassword?.errors) {
+                        logServerErrorPayload(`Datasource Credential UPDATE exportPassword raw error payload (${credentialKey(r)})`, exportedPassword);
+                    }
+                    let msg = exportedPassword?.errors
+                        ? formatServerErrorForLog(exportedPassword)
+                        : "Failed to export source credential password";
                     logSyncAction("UPDATE", "Datasource Credential", credentialKey(r), "error", msg);
                     continue;
                 }
@@ -1514,7 +1941,8 @@ async function syncDatasourceCredentials(api: any, apiKC: any, aesKeyName: strin
                 sourceCred.password = exportedPassword;
                 let res = await io_utils.noThrow(sourceCred.restore(apiKC, aesKeyName));
                 if (res?.errors) {
-                    logSyncAction("UPDATE", "Datasource Credential", credentialKey(r), "error", res.message || "Unknown error");
+                    logServerErrorPayload(`Datasource Credential UPDATE restore raw error payload (${credentialKey(r)})`, res);
+                    logSyncAction("UPDATE", "Datasource Credential", credentialKey(r), "error", formatServerErrorForLog(res));
                 } else {
                     logSyncAction("UPDATE", "Datasource Credential", credentialKey(r), "success");
                 }
@@ -1528,6 +1956,13 @@ async function syncDatasourceCredentials(api: any, apiKC: any, aesKeyName: strin
             let deletedItems = arrayDiff(true, dataKC, dataKJ, compareFunc);
             deletedItems = limitForTest(deletedItems);
             deletedItems = deletedItems.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
+            emitDatasourceDebugLog(
+                "pre-fix",
+                "H2",
+                "scripts/sync-config.ts:syncDatasourceCredentials:deleted-items",
+                "Datasource credential DELETE detection completed",
+                { count: deletedItems.length, keys: deletedItems.map((c: any) => credentialKey(c)) }
+            );
             logMain(`Found ${deletedItems.length} Datasource Credentials to delete`);
 
             for (let r of deletedItems) {
@@ -1535,7 +1970,8 @@ async function syncDatasourceCredentials(api: any, apiKC: any, aesKeyName: strin
                     let deleteCred = io_db_credential.DBCredential.build(r);
                     let res = await io_utils.noThrow(deleteCred.delete(apiKC));
                     if (res?.errors) {
-                        logSyncAction("DELETE", "Datasource Credential", credentialKey(r), "error", res.message || "Unknown error");
+                        logServerErrorPayload(`Datasource Credential DELETE raw error payload (${credentialKey(r)})`, res);
+                        logSyncAction("DELETE", "Datasource Credential", credentialKey(r), "error", formatServerErrorForLog(res));
                     } else {
                         logSyncAction("DELETE", "Datasource Credential", credentialKey(r), "success");
                     }
@@ -1574,8 +2010,9 @@ async function getUserMFAProvider(
 }> {
     const providersHintTab = sourceUserRow ? normalizeUserProvidersString(sourceUserRow) : "";
     const providersDerived = deriveMfaProvidersFromUserRow(sourceUserRow);
+    const exportFirst = providersDerived.providers.find((p) => isExportRestorableMfaProvider(p)) || "none";
     const baseResult = {
-        provider: providersDerived.primary || "none",
+        provider: exportFirst,
         hasMFA: providersDerived.hasMFA,
         providersHintTab,
         providersDerivedProviders: providersDerived.providers,
@@ -1612,9 +2049,6 @@ async function getUserMFAProvider(
  */
 async function exportUserMFAOptions(api: any, username: string, provider: string, aesKeyName: string, traceId?: string): Promise<string | null> {
     try {
-        // #region agent log
-        fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H8',location:'scripts/sync-config.ts:exportUserMFAOptions:start',message:'Attempting MFA export',data:{username,provider},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
         const exportResult = await io_utils.noThrow(api.call("EXPORT_USER_AUTH_PROVIDER_OPTIONS_EX", username, provider, aesKeyName));
         if (exportResult.errors || !Array.isArray(exportResult) || exportResult.length === 0) {
             let detail: string;
@@ -1635,9 +2069,6 @@ async function exportUserMFAOptions(api: any, username: string, provider: string
             logMain(
                 `[TRACE ${traceId || 'no-trace'}] EXPORT_USER_AUTH_PROVIDER_OPTIONS_EX API response (failure) for ${username}: ${stringifyApiPayload(exportResult)}`
             );
-            // #region agent log
-            fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H8',location:'scripts/sync-config.ts:exportUserMFAOptions:error',message:'MFA export failed',data:{username,provider,exportResult},timestamp:Date.now()})}).catch(()=>{});
-            // #endregion
             return null;
         }
         
@@ -1652,9 +2083,6 @@ async function exportUserMFAOptions(api: any, username: string, provider: string
         logMain(
             `[TRACE ${traceId || 'no-trace'}] EXPORT_USER_AUTH_PROVIDER_OPTIONS_EX API response (success) for ${username}: ${stringifyApiPayload(exportResult)}`,
         );
-        // #region agent log
-        fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H8',location:'scripts/sync-config.ts:exportUserMFAOptions:success',message:'MFA export succeeded',data:{username,provider,hasEncryptedValue:!!exportedData.value},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
         
         return exportedData.value;
     } catch (error) {
@@ -1676,7 +2104,7 @@ async function restoreUserMFAOptions(
 ): Promise<RestoreMFAResult> {
     try {
         const tracePrefix = `[TRACE ${traceId || 'no-trace'}]`;
-        const restoreResult = await io_utils.noThrow(api.call("RESTORE_USER_AUTH_PROVIDER_OPTIONS_EX", username, provider, encryptedValue, aesKeyName, null));
+        const restoreResult = await io_utils.noThrow(api.call("RESTORE_USER_AUTH_PROVIDER_OPTIONS_EX", username, provider, encryptedValue, aesKeyName, 99));
         if (restoreResult.errors) {
             logError(`Failed to restore MFA options for user ${username}: ${restoreResult.message || 'Unknown error'}`);
             return { success: false, rawResult: restoreResult };
@@ -1748,6 +2176,11 @@ async function restoreUserPasswordBlob(
     try {
         const restoreResult = await io_utils.noThrow(apiKC.call("RESTORE_USER_PASSWORD_EX", username, encryptedValue, aesKeyName));
         if (restoreResult?.errors) {
+            logError(
+                `${tracePrefix} RESTORE_USER_PASSWORD_EX raw error payload for ${username}: ${stringifyApiPayload(
+                    redactPasswordApiPayloadForLog(restoreResult),
+                )}`,
+            );
             logError(`${tracePrefix} Failed to restore password blob for ${username}: ${restoreResult.message || "Unknown error"}`);
             logDebugAuth(
                 `RESTORE_USER_PASSWORD_EX failed (errors) ${username}: ${stringifyApiPayload(redactPasswordApiPayloadForLog(restoreResult))} ${tracePrefix}`,
@@ -1768,6 +2201,7 @@ async function restoreUserPasswordBlob(
         );
         return true;
     } catch (error) {
+        logError(`${tracePrefix} RESTORE_USER_PASSWORD_EX exception details for ${username}: ${stringifyApiPayload(redactPasswordApiPayloadForLog(error))}`);
         logError(`${tracePrefix} Failed to restore password blob for ${username}: ${error}`);
         logDebugAuth(`RESTORE_USER_PASSWORD_EX exception ${username}: ${error} ${tracePrefix}`);
         return false;
@@ -1814,13 +2248,18 @@ async function applyMamoriUserSecretSyncFromSource(
     traceId: string,
 ): Promise<void> {
     const trace = `[TRACE ${traceId}]`;
-    let mfaInfo: ExportedMFAInfo = { provider: "none", hasMFA: false, encryptedValue: null };
+    let mfaInfo: ExportedMFAInfo = emptyExportedMfaInfo();
     if (syncMamoriMFA) {
         mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r, traceId);
         if (mfaInfo.hasMFA) {
-            logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
-            if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for user ${r.username}`);
-            else logError(`Failed to export MFA options for user ${r.username}, continuing without MFA`);
+            logDetail(`User ${r.username} has MFA provider (export) ${mfaInfo.exportProvider} serverBound=${JSON.stringify(mfaInfo.serverBoundProviders)}`);
+            if (mfaInfo.encryptedValue) {
+                logDetail(`Exported MFA options for user ${r.username}`);
+            } else if (mfaInfo.sourceHasPushmobile) {
+                logDetail(
+                    `MFA for user ${r.username}: pushmobile is server-specific; will enable on target (no hub export)`,
+                );
+            }
         }
     }
     let passwordBlob: string | null = null;
@@ -1850,7 +2289,7 @@ async function applyMamoriUserSecretSyncFromSource(
         );
     }
     if (tempAESKey && syncMamoriMFA) {
-        await restoreUserMFAIfAvailable(apiKC, r.username, mfaInfo.provider, tempAESKey.keyName, mfaInfo, "Mamori User", traceId);
+        await applyMamoriMfaToTarget(apiKC, r, mfaInfo, tempAESKey.keyName, traceId);
     }
     await logSourceTargetUserOptionsComparison(api, apiKC, r.username, traceId, "mdate-secrets");
     const refreshedTarget = (await fetchMamoriUsers(apiKC)).find((u: any) => u.username === r.username) || null;
@@ -1917,10 +2356,8 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
             );
         }
         
-        console.log("!!!!!!!!!!! AI DEBUG MAMORI API- FECTCH USERS");
         let dataKJ = await fetchMamoriUsers(api);
         let dataKC = await fetchMamoriUsers(apiKC);
-        console.log("AI DEBUG MAMORI DATA KC %o", dataKC);
         const targetByUsername = new Map<string, any>(dataKC.map((u: any) => [u.username, u]));
         const sourceByUsername = new Map<string, any>(dataKJ.map((u: any) => [u.username, u]));
         
@@ -1939,13 +2376,20 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 logMain(`[TRACE ${traceId}] Source mamori_users search/list row (raw): ${stringifyApiPayload(r)}`);
                 
                 // Check if user has MFA and export options if available
-                let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
+                let mfaInfo: ExportedMFAInfo = emptyExportedMfaInfo();
                 if (tempAESKey && syncMamoriMFA) {
                     mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r, traceId);
                     if (mfaInfo.hasMFA) {
-                        logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
-                        if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for user ${r.username}`);
-                        else logError(`Failed to export MFA options for user ${r.username}, continuing without MFA`);
+                        logDetail(
+                            `User ${r.username} has MFA: exportProvider=${mfaInfo.exportProvider} serverBound=${JSON.stringify(mfaInfo.serverBoundProviders)}`,
+                        );
+                        if (mfaInfo.encryptedValue) {
+                            logDetail(`Exported MFA options for user ${r.username}`);
+                        } else if (mfaInfo.sourceHasPushmobile) {
+                            logDetail(
+                                `MFA for user ${r.username}: pushmobile is server-specific; will enable on target (no hub export)`,
+                            );
+                        }
                     }
                 }
                 let passwordBlob: string | null = null;
@@ -1998,7 +2442,7 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
 
                     // Restore MFA options if available
                     if (tempAESKey && syncMamoriMFA) {
-                        await restoreUserMFAIfAvailable(apiKC, r.username, mfaInfo.provider, tempAESKey.keyName, mfaInfo, "Mamori User", traceId);
+                        await applyMamoriMfaToTarget(apiKC, r, mfaInfo, tempAESKey.keyName, traceId);
                     }
                     await logSourceTargetUserOptionsComparison(api, apiKC, r.username, traceId, "post-create");
                     const sourceDisabled = normalizeUserDisabled(r);
@@ -2028,36 +2472,10 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
             const sProviders = normalizeUserProvidersString(s);
             const tProviders = normalizeUserProvidersString(t);
             const providersChanged = sProviders !== tProviders;
-            // #region agent log
-            fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H1',location:'scripts/sync-config.ts:mamori-compare-loop',message:'Mamori user source/target raw comparison snapshot',data:{username:s.username,sourceRaw:s,targetRaw:t,normalized:{sourceDisabled:sDisabled,targetDisabled:tDisabled,sourceProviders:sProviders,targetProviders:tProviders}},timestamp:Date.now()})}).catch(()=>{});
-            // #endregion
-            //console.log("AI DEBUG MAMORI COMPARE SOURCE RAW %o", s);
-            //console.log("AI DEBUG MAMORI COMPARE TARGET RAW %o", t);
-            //console.log("AI DEBUG MAMORI COMPARE NORMALIZED", {
-            //    username: s.username,
-            //    sourceDisabled: sDisabled,
-            //    targetDisabled: tDisabled,
-            //    sourceProviders: sProviders,
-            //    targetProviders: tProviders
-            //});
             if (sEmail !== tEmail || sFullname !== tFullname || (sDisabled !== null && tDisabled !== null && sDisabled !== tDisabled) || providersChanged) {
                 logMain(
                     `Detected Mamori user difference for ${s.username}: emailChanged=${sEmail !== tEmail}, fullnameChanged=${sFullname !== tFullname}, disabledChanged=${sDisabled !== null && tDisabled !== null && sDisabled !== tDisabled}, providersChanged=${providersChanged}`
                 );
-                // #region agent log
-                fetch('http://localhost:7439/ingest/cd544e5f-a1e8-4187-a310-31f46aeb065d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'348ce4'},body:JSON.stringify({sessionId:'348ce4',runId:'pre-fix',hypothesisId:'H2',location:'scripts/sync-config.ts:mamori-compare-diff',message:'Mamori user marked for update due to field differences',data:{username:s.username,diff:{emailChanged:sEmail!==tEmail,fullnameChanged:sFullname!==tFullname,disabledChanged:(sDisabled!==null&&tDisabled!==null&&sDisabled!==tDisabled),providersChanged},sourceValues:{email:sEmail,fullname:sFullname,disabled:sDisabled,providers:sProviders},targetValues:{email:tEmail,fullname:tFullname,disabled:tDisabled,providers:tProviders}},timestamp:Date.now()})}).catch(()=>{});
-                // #endregion
-                console.log("AI DEBUG MAMORI DIFF DETECTED", {
-                    username: s.username,
-                    diff: {
-                        emailChanged: sEmail !== tEmail,
-                        fullnameChanged: sFullname !== tFullname,
-                        disabledChanged: (sDisabled !== null && tDisabled !== null && sDisabled !== tDisabled),
-                        providersChanged
-                    },
-                    sourceValues: { email: sEmail, fullname: sFullname, disabled: sDisabled, providers: sProviders },
-                    targetValues: { email: tEmail, fullname: tFullname, disabled: tDisabled, providers: tProviders }
-                });
                 updatedItems.push(s);
             }
         }
@@ -2070,13 +2488,20 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 logMain(`[TRACE ${traceId}] Source mamori_users search/list row (raw): ${stringifyApiPayload(r)}`);
                 
                 // Check if user has MFA and export options if available
-                let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
+                let mfaInfo: ExportedMFAInfo = emptyExportedMfaInfo();
                 if (tempAESKey && syncMamoriMFA) {
                     mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r, traceId);
                     if (mfaInfo.hasMFA) {
-                        logDetail(`User ${r.username} has MFA provider: ${mfaInfo.provider}`);
-                        if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for user ${r.username}`);
-                        else logError(`Failed to export MFA options for user ${r.username}, continuing without MFA`);
+                        logDetail(
+                            `User ${r.username} has MFA: exportProvider=${mfaInfo.exportProvider} serverBound=${JSON.stringify(mfaInfo.serverBoundProviders)}`,
+                        );
+                        if (mfaInfo.encryptedValue) {
+                            logDetail(`Exported MFA options for user ${r.username}`);
+                        } else if (mfaInfo.sourceHasPushmobile) {
+                            logDetail(
+                                `MFA for user ${r.username}: pushmobile is server-specific; will enable on target (no hub export)`,
+                            );
+                        }
                     }
                 }
                 let passwordBlob: string | null = null;
@@ -2121,7 +2546,7 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
 
                     // Restore MFA options if available
                     if (tempAESKey && syncMamoriMFA) {
-                        await restoreUserMFAIfAvailable(apiKC, r.username, mfaInfo.provider, tempAESKey.keyName, mfaInfo, "Mamori User", traceId);
+                        await applyMamoriMfaToTarget(apiKC, r, mfaInfo, tempAESKey.keyName, traceId);
                     }
                     await logSourceTargetUserOptionsComparison(api, apiKC, r.username, traceId, "post-update");
                     const refreshedTarget = (await fetchMamoriUsers(apiKC)).find((u: any) => u.username === r.username) || null;
@@ -2158,10 +2583,7 @@ async function syncMamoriUsers(api: any, apiKC: any): Promise<void> {
                 if (updatedUsernames.has(s.username)) {
                     continue;
                 }
-                console.log("!!!!88888 COMPARING MAMORI USER SOURCE %o %s", s.username,s.modifydate);
-                console.log("!!!!88888 COMPARING MAMORI USER TARGET %o %s", t.username,t.modifydate);
                 const { newer, sourceMs, targetMs } = isSourceMamoriUserNewerByModifyDate(s, t);
-                console.log("!!!!88888 COMPARING MAMORI USER NEWER %o %s", s.username,newer);
                 if (!newer) {
                     continue;
                 }
@@ -2308,13 +2730,20 @@ async function syncDirectoryUsers(api: any, apiKC: any, syncedProviders: string[
                 const mappedTargetProvider = getMappedTargetProvider(r.provider || '');
                 
                 // Check if user has MFA and export options if available
-                let mfaInfo: ExportedMFAInfo = { provider: 'none', hasMFA: false, encryptedValue: null };
+                let mfaInfo: ExportedMFAInfo = emptyExportedMfaInfo();
                 if (tempAESKey && syncDirectoryMFA) {
                     mfaInfo = await exportUserMFAIfPresent(api, r.username, tempAESKey.keyName, r);
                     if (mfaInfo.hasMFA) {
-                        logDetail(`Directory user ${r.username} has MFA provider: ${mfaInfo.provider}`);
-                        if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for directory user ${r.username}`);
-                        else logError(`Failed to export MFA options for directory user ${r.username}, continuing without MFA`);
+                        logDetail(
+                            `Directory user ${r.username} has MFA: exportProvider=${mfaInfo.exportProvider} serverBound=${JSON.stringify(mfaInfo.serverBoundProviders)}`,
+                        );
+                        if (mfaInfo.encryptedValue) {
+                            logDetail(`Exported MFA options for directory user ${r.username}`);
+                        } else if (mfaInfo.sourceHasPushmobile) {
+                            logDetail(
+                                `MFA for directory user ${r.username}: pushmobile is server-specific; will enable on target (no hub export)`,
+                            );
+                        }
                     }
                 }
                 
@@ -2334,7 +2763,7 @@ async function syncDirectoryUsers(api: any, apiKC: any, syncedProviders: string[
                     
                     // Restore MFA options if available
                     if (tempAESKey && syncDirectoryMFA) {
-                        await restoreUserMFAIfAvailable(apiKC, r.username, mappedTargetProvider, tempAESKey.keyName, mfaInfo, "Directory User");
+                        await applyDirectoryMfaToTarget(apiKC, r, mfaInfo, mappedTargetProvider, tempAESKey.keyName);
                     }
                     const createdTarget = (await fetchDirectoryUsers(apiKC)).find((u: any) =>
                         u.username === r.username && normalizeProviderName(u.provider || '') === normalizeProviderName(mappedTargetProvider)
@@ -2368,11 +2797,18 @@ async function syncDirectoryUsers(api: any, apiKC: any, syncedProviders: string[
                 const mappedTargetProvider = getMappedTargetProvider(sourceUser.provider || '');
                 let mfaInfo: ExportedMFAInfo = await exportUserMFAIfPresent(api, sourceUser.username, tempAESKey.keyName, sourceUser);
                 if (mfaInfo.hasMFA) {
-                    logDetail(`Directory user ${sourceUser.username} has MFA provider: ${mfaInfo.provider}`);
-                    if (mfaInfo.encryptedValue) logDetail(`Exported MFA options for directory user ${sourceUser.username}`);
-                    else logError(`Failed to export MFA options for directory user ${sourceUser.username}, continuing without MFA`);
+                    logDetail(
+                        `Directory user ${sourceUser.username} has MFA: exportProvider=${mfaInfo.exportProvider} serverBound=${JSON.stringify(mfaInfo.serverBoundProviders)}`,
+                    );
+                    if (mfaInfo.encryptedValue) {
+                        logDetail(`Exported MFA options for directory user ${sourceUser.username}`);
+                    } else if (mfaInfo.sourceHasPushmobile) {
+                        logDetail(
+                            `MFA for directory user ${sourceUser.username}: pushmobile is server-specific; will enable on target (no hub export)`,
+                        );
+                    }
                 }
-                await restoreUserMFAIfAvailable(apiKC, sourceUser.username, mappedTargetProvider, tempAESKey.keyName, mfaInfo, "Directory User");
+                await applyDirectoryMfaToTarget(apiKC, sourceUser, mfaInfo, mappedTargetProvider, tempAESKey.keyName);
             }
         }
         

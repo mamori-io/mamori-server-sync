@@ -52,7 +52,7 @@
       "^omasri$"
     ],
     "datasources": [
-      "^oracle193$"
+      "^oracle193b$"
     ]
   }
 }
