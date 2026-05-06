@@ -3,6 +3,9 @@ import { DUMMY_DATASOURCE_PASSWORD } from "./constants";
 import type { SyncContext } from "./context";
 import {
     arrayDiff,
+    getObjectFilters,
+    getTestLimit,
+    isTestMode,
     limitForTest,
     normalizeArrayResult,
     shouldDeleteRemoved,
@@ -10,7 +13,7 @@ import {
     shouldSyncDatasourceCredentialObject,
     shouldSyncObject,
 } from "./filters";
-import { formatServerErrorForLog, logServerErrorPayload } from "./logging";
+import { formatServerErrorForLog, logServerErrorPayload, redactPasswordApiPayloadForLog } from "./logging";
 
 export function emitDatasourceDebugLog(ctx: SyncContext, 
     runId: string,
@@ -90,6 +93,199 @@ function parseHostPortFromJdbc(connectionString: string): { host: string; port: 
 }
 
 /**
+ * `Datasource.get` `/v1/systems/:name` returns `options` as either:
+ * - UI rows: `{ optionnameddl, currentvalue, ... }[]` (server API), or
+ * - SQL fragments: `string[]` (see SDK CRUD test comments), or
+ * - a single comma-separated options SQL string.
+ */
+function normalizeDatasourceOptionsSql(raw: any): string {
+    if (raw == null) {
+        return "";
+    }
+    if (Array.isArray(raw)) {
+        if (raw.length === 0) {
+            return "";
+        }
+        const first = raw[0];
+        if (first && typeof first === "object" && first !== null && "optionnameddl" in first) {
+            return raw
+                .map((row: any) => {
+                    const k = String(row?.optionnameddl ?? "").trim();
+                    if (!k) {
+                        return "";
+                    }
+                    const v = row?.currentvalue;
+                    if (v === undefined || v === null) {
+                        return "";
+                    }
+                    const esc = String(v).replace(/'/g, "''");
+                    return `${k} '${esc}'`;
+                })
+                .filter(Boolean)
+                .join(",");
+        }
+        if (typeof first === "string") {
+            return raw.join(",");
+        }
+    }
+    return String(raw);
+}
+
+function parseOptionsSqlToken(options: string, token: string): string {
+    if (!options || !token) {
+        return "";
+    }
+    const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp("(?:^|,)\\s*" + escaped + "\\s+'([^']*)'", "i");
+    const m = options.match(re);
+    return m ? m[1] : "";
+}
+
+/** One UI row from GET `/v1/systems/:name` → `options` (`optionnameddl` / `currentvalue`). */
+function getOptionRowFromDatasourceOptions(
+    rawOptions: any,
+    ddl: string,
+): { found: boolean; value: string } {
+    if (!Array.isArray(rawOptions)) {
+        return { found: false, value: "" };
+    }
+    for (const row of rawOptions) {
+        if (String(row?.optionnameddl ?? "").trim() !== ddl) {
+            continue;
+        }
+        const cv = row?.currentvalue;
+        if (cv === undefined || cv === null) {
+            return { found: true, value: "" };
+        }
+        return { found: true, value: String(cv) };
+    }
+    return { found: false, value: "" };
+}
+
+/**
+ * `Datasource.read` (list API) is incomplete; `Datasource.get` (`/v1/systems/:name`) is authoritative for config.
+ * Spread read for metadata (availability, ids), then overlay every option row from GET so empty CONNECTION_STRING
+ * clears a misleading JDBC string from list rows.
+ */
+function mergeDatasourceReadWithSystemGet(read: any, systemGet: any): any {
+    if (!read || (read as any).errors) {
+        return read;
+    }
+    if (!systemGet || (systemGet as any).errors || typeof systemGet !== "object") {
+        return read;
+    }
+
+    const merged: any = { ...read };
+    const sg = systemGet as any;
+    const rawOpt = sg.options;
+
+    if (sg.system_type) {
+        merged.type = sg.system_type;
+    }
+    if (sg.system_name) {
+        merged.name = sg.system_name;
+    }
+    if (sg.group != null && sg.group !== "") {
+        merged.datasource_group_name = String(sg.group);
+    }
+
+    const first = Array.isArray(rawOpt) && rawOpt.length > 0 ? rawOpt[0] : null;
+    const isUiOptions =
+        first && typeof first === "object" && first !== null && "optionnameddl" in first;
+
+    const overlayFromGet = (ddl: string, apply: (value: string) => void) => {
+        const { found, value } = getOptionRowFromDatasourceOptions(rawOpt, ddl);
+        if (found) {
+            apply(value);
+        }
+    };
+
+    if (isUiOptions) {
+        overlayFromGet("DRIVER", (v) => {
+            merged.driver = v;
+            merged.drivername = v;
+        });
+        overlayFromGet("CONNECTION_STRING", (v) => {
+            merged.connection_string = v;
+            merged.connectionstring = v;
+        });
+        overlayFromGet("HOST", (v) => {
+            merged.host = v;
+        });
+        overlayFromGet("PORT", (v) => {
+            merged.port = v;
+        });
+        overlayFromGet("USER", (v) => {
+            merged.login_userid = v;
+        });
+        overlayFromGet("DEFAULTDATABASE", (v) => {
+            merged.dbname = v;
+        });
+        overlayFromGet("TEMPDATABASE", (v) => {
+            merged.tempdatabase = v;
+        });
+        overlayFromGet("CONNECTION_PROPERTIES", (v) => {
+            merged.urlProperties = v;
+            merged.urlproperties = v;
+            merged.connection_properties = v;
+        });
+        overlayFromGet("CONNECTION_STRING_PROPERTIES", (v) => {
+            merged.connection_string_properties = v;
+        });
+    } else {
+        const opt = normalizeDatasourceOptionsSql(rawOpt);
+        const driverFromOpt = parseOptionsSqlToken(opt, "DRIVER");
+        if (driverFromOpt) {
+            merged.driver = driverFromOpt;
+        }
+        const connStr = parseOptionsSqlToken(opt, "CONNECTION_STRING");
+        if (connStr) {
+            merged.connection_string = connStr;
+        }
+        const host = parseOptionsSqlToken(opt, "HOST");
+        if (host) {
+            merged.host = host;
+        }
+        const port = parseOptionsSqlToken(opt, "PORT");
+        if (port) {
+            merged.port = port;
+        }
+        const user = parseOptionsSqlToken(opt, "USER");
+        if (user) {
+            merged.login_userid = user;
+        }
+        const defDb = parseOptionsSqlToken(opt, "DEFAULTDATABASE");
+        if (defDb) {
+            merged.dbname = defDb;
+        }
+        const urlProps = parseOptionsSqlToken(opt, "CONNECTION_PROPERTIES");
+        if (urlProps) {
+            merged.urlProperties = urlProps;
+        }
+    }
+
+    return merged;
+}
+
+/** Full datasource: SDK `Datasource.read` merged with instance `get()` (system `options` SQL). */
+async function fetchDatasourceDetail(api: any, name: string): Promise<any> {
+    const viaRead = await io_utils.noThrow(io_datasource.Datasource.read(api, name));
+    const viaGet = await io_utils.noThrow(new io_datasource.Datasource(name).get(api));
+    const merged = mergeDatasourceReadWithSystemGet(viaRead, viaGet);
+    console.log("!!! 003 merged %o", merged);
+    // #region agent log
+    (() => {
+        const rawOpt = (viaGet as any)?.options;
+        const row0 = Array.isArray(rawOpt) && rawOpt.length > 0 ? rawOpt[0] : null;
+        const optRaw = normalizeDatasourceOptionsSql(rawOpt);
+        const redact = (s: string) => s.replace(/PASSWORD\s+'[^']*'/gi, "PASSWORD '<redacted>'");
+        fetch('http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f538ee'},body:JSON.stringify({sessionId:'f538ee',runId:'sdk-merge-read-get',hypothesisId:'H-read-plus-get-merge',location:'scripts/sync/datasource-sync.ts:fetchDatasourceDetail:merged',message:'Merged read+get for sync row',data:{name,readHasErrors:!!(viaRead as any)?.errors,getHasErrors:!!(viaGet as any)?.errors,mergedHasDriver:!!(merged as any)?.driver,optionsIsArray:Array.isArray(rawOpt),optionsRow0Type:row0==null?'none':typeof row0,optionsRow0Keys:row0&&typeof row0==='object'?Object.keys(row0):[],optionnameddlSample:Array.isArray(rawOpt)?rawOpt.slice(0,25).map((r: any)=>String(r?.optionnameddl??"")): [],optionsJoinedLen:optRaw.length,driverFromOptions:parseOptionsSqlToken(optRaw,'DRIVER'),optionsHasDriverKeyword:/\bDRIVER\b/i.test(optRaw),optionsPreview:redact(optRaw).slice(0,260),readKeys:Object.keys((viaRead as any)||{}).slice(0,25),getKeys:Object.keys((viaGet as any)||{}).slice(0,25)},timestamp:Date.now()})}).catch(()=>{});
+    })();
+    // #endregion
+    return merged;
+}
+
+/**
  * Map `Datasource.read` / `getAll` row shape into SDK `Datasource` property names
  * (same names used by `Datasource.build` / `fromJSON` and CRUD tests).
  */
@@ -112,7 +308,11 @@ function databaseRowToSdkDatasourceInput(row: any): any {
     out.tempDatabase = str(row.tempDatabase ?? row.tempdatabase);
     out.connection_string = str(row.connection_string ?? row.connectionstring);
     out.urlProperties = str(
-        row.urlProperties ?? row.urlproperties ?? row.connection_properties ?? row.jdbc_properties
+        row.urlProperties ??
+            row.urlproperties ??
+            row.connection_properties ??
+            row.connection_string_properties ??
+            row.jdbc_properties
     );
     out.extraOptions = str(row.extraOptions ?? row.extra_options);
     out.group = str(row.group ?? row.datasourcegroup);
@@ -375,9 +575,40 @@ export async function syncDatasourcesCreateNewDisabled(
         }
 
         let newItems = arrayDiff(true, dataKJ, dataKC, compareFunc);
+        const dbgCountAfterDiff = newItems.length;
         newItems = newItems.filter((ds: any) => shouldSyncObject("datasources", dsName(ds)));
+        const dbgCountAfterObjectFilter = newItems.length;
         newItems = limitForTest(newItems);
-        emitDatasourceDebugLog(ctx, 
+        const dbgCountAfterLimit = newItems.length;
+        // #region agent log
+        fetch("http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3695d9" },
+            body: JSON.stringify({
+                sessionId: "3695d9",
+                runId: "ds-create-detect",
+                hypothesisId: "H1",
+                location: "datasource-sync.ts:syncDatasourcesCreateNewDisabled:newItems",
+                message: "Datasource create queue after diff/filter/limit",
+                data: {
+                    sourceListCount: dataKJ.length,
+                    targetListCount: dataKC.length,
+                    afterDiff: dbgCountAfterDiff,
+                    afterObjectFilter: dbgCountAfterObjectFilter,
+                    afterTestLimit: dbgCountAfterLimit,
+                    isTestMode: isTestMode(),
+                    testLimit: getTestLimit(),
+                    datasourceObjectFilters: getObjectFilters("datasources"),
+                    namesToCreate: newItems.map((ds: any) => dsName(ds)),
+                },
+                timestamp: Date.now(),
+            }),
+        }).catch(() => {});
+        // #endregion
+        ctx.logMain(
+            `[DEBUG-3695d9] DS create queue: sourceRows=${dataKJ.length} targetRows=${dataKC.length} afterDiff=${dbgCountAfterDiff} afterObjectFilter=${dbgCountAfterObjectFilter} afterTestLimit=${dbgCountAfterLimit} testMode=${isTestMode()} filters=${JSON.stringify(getObjectFilters("datasources"))}`,
+        );
+        emitDatasourceDebugLog(ctx,
             "pre-fix",
             "H2",
             "scripts/sync-config.ts:syncDatasources:new-items",
@@ -394,7 +625,7 @@ export async function syncDatasourcesCreateNewDisabled(
 
         for (let r of newItems) {
             try {
-                let sourceDs = await io_utils.noThrow(io_datasource.Datasource.read(api, r.name));
+                let sourceDs = await fetchDatasourceDetail(api, r.name);
                 if (sourceDs?.errors || !sourceDs) {
                     let msg = sourceDs?.message || "Failed to read source datasource";
                     ctx.logSyncAction("CREATE", "Datasource", r.name, "error", msg);
@@ -472,6 +703,24 @@ export async function syncDatasourcesApplyAfterCredentials(
 
     try {
         ctx.logMain("Starting Datasources synchronization (apply updates after credentials)...");
+        // #region agent log
+        fetch("http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3695d9" },
+            body: JSON.stringify({
+                sessionId: "3695d9",
+                runId: "ds-apply-start",
+                hypothesisId: "H2",
+                location: "datasource-sync.ts:syncDatasourcesApplyAfterCredentials:entry",
+                message: "Apply phase datasource state",
+                data: {
+                    createdNamesThisRun: Array.from(phase.createdNamesThisRun),
+                    preExistingCount: phase.preExistingOnTarget.size,
+                },
+                timestamp: Date.now(),
+            }),
+        }).catch(() => {});
+        // #endregion
 
         let sourceResult = await io_utils.noThrow(io_datasource.Datasource.getAll(api));
         let targetResult = await io_utils.noThrow(io_datasource.Datasource.getAll(apiKC));
@@ -486,7 +735,8 @@ export async function syncDatasourcesApplyAfterCredentials(
         );
 
         // UPDATE — only datasources that existed on target before this run (exclude just-created rows)
-        let updatedItems: any[] = [];
+        type DatasourceUpdatePair = { name: string; sourceDs: any; targetDs: any };
+        let updatedItems: DatasourceUpdatePair[] = [];
         for (let s of filteredSourceDatasources) {
             const name = dsName(s);
             if (!phase.preExistingOnTarget.has(name) || phase.createdNamesThisRun.has(name)) {
@@ -496,8 +746,8 @@ export async function syncDatasourcesApplyAfterCredentials(
             if (!t) {
                 continue;
             }
-            let sourceDs = await io_utils.noThrow(io_datasource.Datasource.read(api, s.name));
-            let targetDs = await io_utils.noThrow(io_datasource.Datasource.read(apiKC, s.name));
+            let sourceDs = await fetchDatasourceDetail(api, s.name);
+            let targetDs = await fetchDatasourceDetail(apiKC, s.name);
             if (!sourceDs?.errors && !targetDs?.errors && sourceDs && targetDs) {
                 const sourceNorm = databaseRowToSdkDatasourceInput(sourceDs);
                 const targetNorm = databaseRowToSdkDatasourceInput(targetDs);
@@ -509,7 +759,7 @@ export async function syncDatasourcesApplyAfterCredentials(
                         "Datasource marked as modified (SDK-normalized fields)",
                         { datasource: s.name }
                     );
-                    updatedItems.push(sourceDs);
+                    updatedItems.push({ name: s.name, sourceDs, targetDs });
                 }
             }
         }
@@ -520,14 +770,13 @@ export async function syncDatasourcesApplyAfterCredentials(
             "H3",
             "scripts/sync-config.ts:syncDatasources:updated-items",
             "Datasource UPDATE detection completed",
-            { count: updatedItems.length, names: updatedItems.map((ds: any) => dsName(ds)) }
+            { count: updatedItems.length, names: updatedItems.map((p) => p.name) }
         );
         ctx.logMain(`Found ${updatedItems.length} Datasources to update`);
 
         for (let r of updatedItems) {
             try {
-                let sourceDs = await io_utils.noThrow(io_datasource.Datasource.read(api, r.name));
-                let targetDs = await io_utils.noThrow(io_datasource.Datasource.read(apiKC, r.name));
+                const { sourceDs, targetDs } = r;
                 if (sourceDs?.errors || targetDs?.errors || !sourceDs || !targetDs) {
                     let msg = sourceDs?.message || targetDs?.message || "Failed to read datasource for update";
                     ctx.logSyncAction("UPDATE", "Datasource", r.name, "error", msg);
@@ -557,29 +806,110 @@ export async function syncDatasourcesApplyAfterCredentials(
         // Enable newly created datasources when source is enabled (credentials already migrated)
         for (const name of Array.from(phase.createdNamesThisRun)) {
             try {
-                let sourceDs = await io_utils.noThrow(io_datasource.Datasource.read(api, name));
-                let targetDs = await io_utils.noThrow(io_datasource.Datasource.read(apiKC, name));
+                let sourceDs = await fetchDatasourceDetail(api, name);
+                let targetDs = await fetchDatasourceDetail(apiKC, name);
                 if (sourceDs?.errors || targetDs?.errors || !sourceDs || !targetDs) {
+                    ctx.logMain(
+                        `[DEBUG-3695d9] DS enable skip (${name}): fetch source/target detail failed`,
+                    );
+                    // #region agent log
+                    fetch("http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3695d9" },
+                        body: JSON.stringify({
+                            sessionId: "3695d9",
+                            runId: "ds-enable",
+                            hypothesisId: "H3",
+                            location: "datasource-sync.ts:syncDatasourcesApplyAfterCredentials:enable",
+                            message: "Enable skipped: fetch detail failed",
+                            data: {
+                                name,
+                                sourceErrors: !!sourceDs?.errors,
+                                targetErrors: !!targetDs?.errors,
+                            },
+                            timestamp: Date.now(),
+                        }),
+                    }).catch(() => {});
+                    // #endregion
                     continue;
                 }
                 const sourceNorm = databaseRowToSdkDatasourceInput(sourceDs);
                 if (!sourceNorm.enabled) {
+                    ctx.logMain(
+                        `[DEBUG-3695d9] DS enable skip (${name}): source enabled=false (sync only enables when source DS is enabled)`,
+                    );
+                    // #region agent log
+                    fetch("http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3695d9" },
+                        body: JSON.stringify({
+                            sessionId: "3695d9",
+                            runId: "ds-enable",
+                            hypothesisId: "H3",
+                            location: "datasource-sync.ts:syncDatasourcesApplyAfterCredentials:enable",
+                            message: "Enable skipped: source datasource disabled in source server",
+                            data: { name, sourceEnabled: !!sourceNorm.enabled },
+                            timestamp: Date.now(),
+                        }),
+                    }).catch(() => {});
+                    // #endregion
                     continue;
                 }
                 const targetNorm = databaseRowToSdkDatasourceInput(targetDs);
                 if (targetNorm.enabled) {
+                    ctx.logMain(`[DEBUG-3695d9] DS enable skip (${name}): target already enabled`);
+                    // #region agent log
+                    fetch("http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3695d9" },
+                        body: JSON.stringify({
+                            sessionId: "3695d9",
+                            runId: "ds-enable",
+                            hypothesisId: "H4",
+                            location: "datasource-sync.ts:syncDatasourcesApplyAfterCredentials:enable",
+                            message: "Enable skipped: target already enabled",
+                            data: { name, targetEnabled: !!targetNorm.enabled },
+                            timestamp: Date.now(),
+                        }),
+                    }).catch(() => {});
+                    // #endregion
                     continue;
                 }
                 let updateDs = io_datasource.Datasource.build(targetNorm);
                 let res = await io_utils.noThrow(updateDs.update(apiKC, { enabled: true }, true));
+                // #region agent log
+                fetch("http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3695d9" },
+                    body: JSON.stringify({
+                        sessionId: "3695d9",
+                        runId: "ds-enable",
+                        hypothesisId: "H5",
+                        location: "datasource-sync.ts:syncDatasourcesApplyAfterCredentials:enable",
+                        message: "Enable-after-create update result",
+                        data: {
+                            name,
+                            hasErrors: !!res?.errors,
+                            formattedError: res?.errors ? formatServerErrorForLog(res) : "",
+                            responseSummary: redactPasswordApiPayloadForLog(res),
+                        },
+                        timestamp: Date.now(),
+                    }),
+                }).catch(() => {});
+                // #endregion
                 if (res?.errors) {
                     logServerErrorPayload(ctx.logError, `Datasource ENABLE-after-create raw error (${name})`, res);
                     ctx.logSyncAction("UPDATE", "Datasource", name, "error", formatServerErrorForLog(res));
+                    ctx.logMain(
+                        `[DEBUG-3695d9] DS enable FAILED (${name}): ${formatServerErrorForLog(res)}`,
+                    );
                 } else {
                     ctx.logSyncAction("UPDATE", "Datasource", name, "success");
+                    ctx.logMain(`[DEBUG-3695d9] DS enable OK (${name}): set enabled=true on target`);
                 }
             } catch (error) {
                 ctx.logSyncAction("UPDATE", "Datasource", name, "error", error.toString());
+                ctx.logMain(`[DEBUG-3695d9] DS enable exception (${name}): ${error}`);
             }
         }
 
@@ -599,7 +929,7 @@ export async function syncDatasourcesApplyAfterCredentials(
 
             for (let r of deletedItems) {
                 try {
-                    let targetDs = await io_utils.noThrow(io_datasource.Datasource.read(apiKC, r.name));
+                    let targetDs = await fetchDatasourceDetail(apiKC, r.name);
                     if (targetDs?.errors || !targetDs) {
                         let msg = targetDs?.message || "Failed to read target datasource";
                         ctx.logSyncAction("DELETE", "Datasource", r.name, "error", msg);
