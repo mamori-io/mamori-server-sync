@@ -3,9 +3,6 @@ import { DUMMY_DATASOURCE_PASSWORD } from "./constants";
 import type { SyncContext } from "./context";
 import {
     arrayDiff,
-    getObjectFilters,
-    getTestLimit,
-    isTestMode,
     limitForTest,
     normalizeArrayResult,
     shouldDeleteRemoved,
@@ -13,25 +10,54 @@ import {
     shouldSyncDatasourceCredentialObject,
     shouldSyncObject,
 } from "./filters";
-import { formatServerErrorForLog, logServerErrorPayload, redactPasswordApiPayloadForLog } from "./logging";
+import { formatServerErrorForLog, logServerErrorPayload } from "./logging";
 
-export function emitDatasourceDebugLog(ctx: SyncContext, 
-    runId: string,
-    hypothesisId: string,
-    location: string,
-    message: string,
-    data: any
-): void {
-    let compact = "";
-    try {
-        compact = JSON.stringify(data);
-    } catch {
-        compact = String(data);
+function normalizeGranteeForCredential(g: any): string {
+    if (g == null || String(g).trim() === "") {
+        return "@";
     }
-    ctx.logMain(`[DBTRACE][${hypothesisId}] ${location} | ${message} | ${compact}`);
-    // #region agent log
-    fetch('http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f538ee'},body:JSON.stringify({sessionId:'f538ee',runId,hypothesisId,location,message,data,timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
+    return String(g);
+}
+
+function credentialListRowMatches(
+    row: any,
+    datasource: string,
+    login: string,
+    grantee: string,
+): boolean {
+    const rds = String(row.systemname || row.datasource || "");
+    const rlogin = String(row.accessname || row.remoteusername || "");
+    const rg = normalizeGranteeForCredential(row.grantee);
+    return (
+        rds === String(datasource) &&
+        rlogin === String(login) &&
+        rg === normalizeGranteeForCredential(grantee)
+    );
+}
+
+async function assertTargetCredentialListedAfterRestore(
+    ctx: SyncContext,
+    apiKC: any,
+    datasource: string,
+    login: string,
+    grantee: string,
+    phase: "CREATE" | "UPDATE",
+    syncKey: string,
+): Promise<void> {
+    const results = await io_utils.noThrow(
+        io_db_credential.DBCredential.listFor(apiKC, 0, 1000, datasource, null, null),
+    );
+    const rows = normalizeArrayResult(results);
+    const found = rows.some((row: any) => credentialListRowMatches(row, datasource, login, grantee));
+    const keys = rows.map(
+        (c: any) =>
+            `${c.systemname || c.datasource}|${c.accessname || c.remoteusername || ""}|${normalizeGranteeForCredential(c.grantee)}`,
+    );
+    if (!found) {
+        const msg = `Post-restore verify failed (${phase}) for ${syncKey}: credential "${datasource}" / "${login}" / "${normalizeGranteeForCredential(grantee)}" not in target list after RESTORE_DATASOURCE_CREDENTIAL_EX. Target keys: ${JSON.stringify(keys)}`;
+        ctx.logError(msg);
+        throw new Error(msg);
+    }
 }
 
 /** Fields aligned with mamori-ent-js-sdk `Datasource` / `generateOptionsSQL` for create/update. */
@@ -271,18 +297,40 @@ function mergeDatasourceReadWithSystemGet(read: any, systemGet: any): any {
 async function fetchDatasourceDetail(api: any, name: string): Promise<any> {
     const viaRead = await io_utils.noThrow(io_datasource.Datasource.read(api, name));
     const viaGet = await io_utils.noThrow(new io_datasource.Datasource(name).get(api));
-    const merged = mergeDatasourceReadWithSystemGet(viaRead, viaGet);
-    console.log("!!! 003 merged %o", merged);
-    // #region agent log
-    (() => {
-        const rawOpt = (viaGet as any)?.options;
-        const row0 = Array.isArray(rawOpt) && rawOpt.length > 0 ? rawOpt[0] : null;
-        const optRaw = normalizeDatasourceOptionsSql(rawOpt);
-        const redact = (s: string) => s.replace(/PASSWORD\s+'[^']*'/gi, "PASSWORD '<redacted>'");
-        fetch('http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f538ee'},body:JSON.stringify({sessionId:'f538ee',runId:'sdk-merge-read-get',hypothesisId:'H-read-plus-get-merge',location:'scripts/sync/datasource-sync.ts:fetchDatasourceDetail:merged',message:'Merged read+get for sync row',data:{name,readHasErrors:!!(viaRead as any)?.errors,getHasErrors:!!(viaGet as any)?.errors,mergedHasDriver:!!(merged as any)?.driver,optionsIsArray:Array.isArray(rawOpt),optionsRow0Type:row0==null?'none':typeof row0,optionsRow0Keys:row0&&typeof row0==='object'?Object.keys(row0):[],optionnameddlSample:Array.isArray(rawOpt)?rawOpt.slice(0,25).map((r: any)=>String(r?.optionnameddl??"")): [],optionsJoinedLen:optRaw.length,driverFromOptions:parseOptionsSqlToken(optRaw,'DRIVER'),optionsHasDriverKeyword:/\bDRIVER\b/i.test(optRaw),optionsPreview:redact(optRaw).slice(0,260),readKeys:Object.keys((viaRead as any)||{}).slice(0,25),getKeys:Object.keys((viaGet as any)||{}).slice(0,25)},timestamp:Date.now()})}).catch(()=>{});
-    })();
-    // #endregion
-    return merged;
+    return mergeDatasourceReadWithSystemGet(viaRead, viaGet);
+}
+
+/**
+ * Normalize `enabled` from API/SDK rows. Some responses use string `"false"` / `"true"`;
+ * `!!"false"` is incorrectly true in JavaScript.
+ */
+function coerceDatasourceEnabled(value: unknown): boolean | undefined {
+    if (value === undefined) {
+        return undefined;
+    }
+    if (value === null) {
+        return false;
+    }
+    if (typeof value === "boolean") {
+        return value;
+    }
+    if (typeof value === "number") {
+        if (Number.isNaN(value)) {
+            return undefined;
+        }
+        return value !== 0;
+    }
+    if (typeof value === "string") {
+        const s = value.trim().toLowerCase();
+        if (s === "" || s === "false" || s === "0" || s === "no" || s === "off" || s === "n") {
+            return false;
+        }
+        if (s === "true" || s === "1" || s === "yes" || s === "on" || s === "y") {
+            return true;
+        }
+        return undefined;
+    }
+    return Boolean(value);
 }
 
 /**
@@ -316,7 +364,12 @@ function databaseRowToSdkDatasourceInput(row: any): any {
     );
     out.extraOptions = str(row.extraOptions ?? row.extra_options);
     out.group = str(row.group ?? row.datasourcegroup);
-    if (row.enabled !== undefined) out.enabled = !!row.enabled;
+    {
+        const enabled = coerceDatasourceEnabled(row.enabled);
+        if (enabled !== undefined) {
+            out.enabled = enabled;
+        }
+    }
     if (row.caseSensitive !== undefined) out.caseSensitive = !!row.caseSensitive;
     out.credential_reset_days =
         row.credential_reset_days != null && String(row.credential_reset_days) !== ""
@@ -369,7 +422,9 @@ function datasourcePatchForUpdate(sourceNorm: any, targetNorm: any): any {
 
 function applyDatasourceOptionalFields(ds: any, norm: any): void {
     if (norm.group) ds.inGroup(String(norm.group));
-    if (norm.enabled !== undefined) ds.enable(!!norm.enabled);
+    if (norm.enabled !== undefined) {
+        ds.enable(coerceDatasourceEnabled(norm.enabled) ?? false);
+    }
     if (norm.caseSensitive !== undefined) ds.withCaseSensitive(!!norm.caseSensitive);
     if (norm.credential_reset_days || norm.credential_role) {
         ds.withPasswordPolicy(String(norm.credential_reset_days || ""), String(norm.credential_role || ""));
@@ -469,18 +524,11 @@ export type DatasourceSyncPhaseState = {
     /** Names successfully created in phase A (disabled + dummy password path). */
     createdNamesThisRun: Set<string>;
 };
-export async function getFilteredDatasourceNames(ctx: SyncContext, api: any, apiKC?: any): Promise<string[]> {
+export async function getFilteredDatasourceNames(_ctx: SyncContext, api: any, apiKC?: any): Promise<string[]> {
     const names = new Set<string>();
 
     const sourceResult = await io_utils.noThrow(io_datasource.Datasource.getAll(api));
     const sourceItems = normalizeArrayResult(sourceResult);
-    emitDatasourceDebugLog(ctx, 
-        "pre-fix",
-        "H1",
-        "scripts/sync-config.ts:getFilteredDatasourceNames:source",
-        "Datasource source list fetched before filter",
-        { fetchedCount: Array.isArray(sourceItems) ? sourceItems.length : -1 }
-    );
     sourceItems.forEach((ds: any) => {
         const name = ds?.name || '';
         if (name && shouldSyncObject('datasources', name)) {
@@ -491,13 +539,6 @@ export async function getFilteredDatasourceNames(ctx: SyncContext, api: any, api
     if (apiKC) {
         const targetResult = await io_utils.noThrow(io_datasource.Datasource.getAll(apiKC));
         const targetItems = normalizeArrayResult(targetResult);
-        emitDatasourceDebugLog(ctx, 
-            "pre-fix",
-            "H1",
-            "scripts/sync-config.ts:getFilteredDatasourceNames:target",
-            "Datasource target list fetched before filter",
-            { fetchedCount: Array.isArray(targetItems) ? targetItems.length : -1 }
-        );
         targetItems.forEach((ds: any) => {
             const name = ds?.name || '';
             if (name && shouldSyncObject('datasources', name)) {
@@ -507,20 +548,12 @@ export async function getFilteredDatasourceNames(ctx: SyncContext, api: any, api
     }
 
     const filtered = Array.from(names);
-    emitDatasourceDebugLog(ctx, 
-        "pre-fix",
-        "H1",
-        "scripts/sync-config.ts:getFilteredDatasourceNames:return",
-        "Datasource names after filter union",
-        { filteredCount: filtered.length, filteredNames: filtered }
-    );
     return filtered;
 }
 
 export async function listDatasourceCredentialsForDatasources(
     api: any,
     datasourceNames: string[],
-    debugLog: boolean = false
 ): Promise<any[]> {
     let credentials: any[] = [];
 
@@ -575,46 +608,8 @@ export async function syncDatasourcesCreateNewDisabled(
         }
 
         let newItems = arrayDiff(true, dataKJ, dataKC, compareFunc);
-        const dbgCountAfterDiff = newItems.length;
         newItems = newItems.filter((ds: any) => shouldSyncObject("datasources", dsName(ds)));
-        const dbgCountAfterObjectFilter = newItems.length;
         newItems = limitForTest(newItems);
-        const dbgCountAfterLimit = newItems.length;
-        // #region agent log
-        fetch("http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3695d9" },
-            body: JSON.stringify({
-                sessionId: "3695d9",
-                runId: "ds-create-detect",
-                hypothesisId: "H1",
-                location: "datasource-sync.ts:syncDatasourcesCreateNewDisabled:newItems",
-                message: "Datasource create queue after diff/filter/limit",
-                data: {
-                    sourceListCount: dataKJ.length,
-                    targetListCount: dataKC.length,
-                    afterDiff: dbgCountAfterDiff,
-                    afterObjectFilter: dbgCountAfterObjectFilter,
-                    afterTestLimit: dbgCountAfterLimit,
-                    isTestMode: isTestMode(),
-                    testLimit: getTestLimit(),
-                    datasourceObjectFilters: getObjectFilters("datasources"),
-                    namesToCreate: newItems.map((ds: any) => dsName(ds)),
-                },
-                timestamp: Date.now(),
-            }),
-        }).catch(() => {});
-        // #endregion
-        ctx.logMain(
-            `[DEBUG-3695d9] DS create queue: sourceRows=${dataKJ.length} targetRows=${dataKC.length} afterDiff=${dbgCountAfterDiff} afterObjectFilter=${dbgCountAfterObjectFilter} afterTestLimit=${dbgCountAfterLimit} testMode=${isTestMode()} filters=${JSON.stringify(getObjectFilters("datasources"))}`,
-        );
-        emitDatasourceDebugLog(ctx,
-            "pre-fix",
-            "H2",
-            "scripts/sync-config.ts:syncDatasources:new-items",
-            "Datasource NEW detection completed",
-            { count: newItems.length, names: newItems.map((ds: any) => dsName(ds)) }
-        );
         ctx.logMain(`Found ${newItems.length} Datasources to create`);
 
         if (newItems.length > 0 && !shouldSync("datasource_credentials")) {
@@ -638,32 +633,7 @@ export async function syncDatasourcesCreateNewDisabled(
                     continue;
                 }
                 built.ds.enable(false);
-                const rawShape = built.ds.toJSON();
-                const safeLogShape = {
-                    ...rawShape,
-                    password: rawShape?.password ? "<redacted>" : rawShape?.password,
-                };
-                emitDatasourceDebugLog(ctx, 
-                    "pre-fix",
-                    "H4",
-                    "scripts/sync-config.ts:syncDatasources:create-send",
-                    "Datasource create via SDK Datasource.create (same as mamori-ent-js-sdk CRUD tests)",
-                    {
-                        datasource: r.name,
-                        createMode: built.mode,
-                        normalizedKeys: Object.keys(normalized),
-                        sdkShapeKeys: Object.keys(safeLogShape),
-                        sdkShape: safeLogShape,
-                    }
-                );
                 let res = await io_utils.noThrow(built.ds.create(apiKC));
-                emitDatasourceDebugLog(ctx, 
-                    "pre-fix",
-                    "H4",
-                    "scripts/sync-config.ts:syncDatasources:create-result",
-                    "Datasource create API returned",
-                    { datasource: r.name, hasErrors: !!res?.errors, message: res?.message || "", resultType: typeof res }
-                );
                 if (res?.errors) {
                     logServerErrorPayload(ctx.logError, `Datasource CREATE raw error payload (${r.name})`, res);
                     ctx.logSyncAction("CREATE", "Datasource", r.name, "error", formatServerErrorForLog(res));
@@ -703,24 +673,6 @@ export async function syncDatasourcesApplyAfterCredentials(
 
     try {
         ctx.logMain("Starting Datasources synchronization (apply updates after credentials)...");
-        // #region agent log
-        fetch("http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3695d9" },
-            body: JSON.stringify({
-                sessionId: "3695d9",
-                runId: "ds-apply-start",
-                hypothesisId: "H2",
-                location: "datasource-sync.ts:syncDatasourcesApplyAfterCredentials:entry",
-                message: "Apply phase datasource state",
-                data: {
-                    createdNamesThisRun: Array.from(phase.createdNamesThisRun),
-                    preExistingCount: phase.preExistingOnTarget.size,
-                },
-                timestamp: Date.now(),
-            }),
-        }).catch(() => {});
-        // #endregion
 
         let sourceResult = await io_utils.noThrow(io_datasource.Datasource.getAll(api));
         let targetResult = await io_utils.noThrow(io_datasource.Datasource.getAll(apiKC));
@@ -752,26 +704,12 @@ export async function syncDatasourcesApplyAfterCredentials(
                 const sourceNorm = databaseRowToSdkDatasourceInput(sourceDs);
                 const targetNorm = databaseRowToSdkDatasourceInput(targetDs);
                 if (normalizedDatasourcesDiffer(sourceNorm, targetNorm)) {
-                    emitDatasourceDebugLog(ctx, 
-                        "pre-fix",
-                        "H3",
-                        "scripts/sync-config.ts:syncDatasources:update-detect",
-                        "Datasource marked as modified (SDK-normalized fields)",
-                        { datasource: s.name }
-                    );
                     updatedItems.push({ name: s.name, sourceDs, targetDs });
                 }
             }
         }
 
         updatedItems = limitForTest(updatedItems);
-        emitDatasourceDebugLog(ctx, 
-            "pre-fix",
-            "H3",
-            "scripts/sync-config.ts:syncDatasources:updated-items",
-            "Datasource UPDATE detection completed",
-            { count: updatedItems.length, names: updatedItems.map((p) => p.name) }
-        );
         ctx.logMain(`Found ${updatedItems.length} Datasources to update`);
 
         for (let r of updatedItems) {
@@ -809,107 +747,26 @@ export async function syncDatasourcesApplyAfterCredentials(
                 let sourceDs = await fetchDatasourceDetail(api, name);
                 let targetDs = await fetchDatasourceDetail(apiKC, name);
                 if (sourceDs?.errors || targetDs?.errors || !sourceDs || !targetDs) {
-                    ctx.logMain(
-                        `[DEBUG-3695d9] DS enable skip (${name}): fetch source/target detail failed`,
-                    );
-                    // #region agent log
-                    fetch("http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3695d9" },
-                        body: JSON.stringify({
-                            sessionId: "3695d9",
-                            runId: "ds-enable",
-                            hypothesisId: "H3",
-                            location: "datasource-sync.ts:syncDatasourcesApplyAfterCredentials:enable",
-                            message: "Enable skipped: fetch detail failed",
-                            data: {
-                                name,
-                                sourceErrors: !!sourceDs?.errors,
-                                targetErrors: !!targetDs?.errors,
-                            },
-                            timestamp: Date.now(),
-                        }),
-                    }).catch(() => {});
-                    // #endregion
                     continue;
                 }
                 const sourceNorm = databaseRowToSdkDatasourceInput(sourceDs);
                 if (!sourceNorm.enabled) {
-                    ctx.logMain(
-                        `[DEBUG-3695d9] DS enable skip (${name}): source enabled=false (sync only enables when source DS is enabled)`,
-                    );
-                    // #region agent log
-                    fetch("http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3695d9" },
-                        body: JSON.stringify({
-                            sessionId: "3695d9",
-                            runId: "ds-enable",
-                            hypothesisId: "H3",
-                            location: "datasource-sync.ts:syncDatasourcesApplyAfterCredentials:enable",
-                            message: "Enable skipped: source datasource disabled in source server",
-                            data: { name, sourceEnabled: !!sourceNorm.enabled },
-                            timestamp: Date.now(),
-                        }),
-                    }).catch(() => {});
-                    // #endregion
                     continue;
                 }
                 const targetNorm = databaseRowToSdkDatasourceInput(targetDs);
                 if (targetNorm.enabled) {
-                    ctx.logMain(`[DEBUG-3695d9] DS enable skip (${name}): target already enabled`);
-                    // #region agent log
-                    fetch("http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3695d9" },
-                        body: JSON.stringify({
-                            sessionId: "3695d9",
-                            runId: "ds-enable",
-                            hypothesisId: "H4",
-                            location: "datasource-sync.ts:syncDatasourcesApplyAfterCredentials:enable",
-                            message: "Enable skipped: target already enabled",
-                            data: { name, targetEnabled: !!targetNorm.enabled },
-                            timestamp: Date.now(),
-                        }),
-                    }).catch(() => {});
-                    // #endregion
                     continue;
                 }
                 let updateDs = io_datasource.Datasource.build(targetNorm);
                 let res = await io_utils.noThrow(updateDs.update(apiKC, { enabled: true }, true));
-                // #region agent log
-                fetch("http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3695d9" },
-                    body: JSON.stringify({
-                        sessionId: "3695d9",
-                        runId: "ds-enable",
-                        hypothesisId: "H5",
-                        location: "datasource-sync.ts:syncDatasourcesApplyAfterCredentials:enable",
-                        message: "Enable-after-create update result",
-                        data: {
-                            name,
-                            hasErrors: !!res?.errors,
-                            formattedError: res?.errors ? formatServerErrorForLog(res) : "",
-                            responseSummary: redactPasswordApiPayloadForLog(res),
-                        },
-                        timestamp: Date.now(),
-                    }),
-                }).catch(() => {});
-                // #endregion
                 if (res?.errors) {
                     logServerErrorPayload(ctx.logError, `Datasource ENABLE-after-create raw error (${name})`, res);
                     ctx.logSyncAction("UPDATE", "Datasource", name, "error", formatServerErrorForLog(res));
-                    ctx.logMain(
-                        `[DEBUG-3695d9] DS enable FAILED (${name}): ${formatServerErrorForLog(res)}`,
-                    );
                 } else {
                     ctx.logSyncAction("UPDATE", "Datasource", name, "success");
-                    ctx.logMain(`[DEBUG-3695d9] DS enable OK (${name}): set enabled=true on target`);
                 }
             } catch (error) {
                 ctx.logSyncAction("UPDATE", "Datasource", name, "error", error.toString());
-                ctx.logMain(`[DEBUG-3695d9] DS enable exception (${name}): ${error}`);
             }
         }
 
@@ -918,13 +775,6 @@ export async function syncDatasourcesApplyAfterCredentials(
             let deletedItems = arrayDiff(true, dataKC, dataKJ, compareFunc);
             deletedItems = deletedItems.filter((ds: any) => shouldSyncObject("datasources", dsName(ds)));
             deletedItems = limitForTest(deletedItems);
-            emitDatasourceDebugLog(ctx, 
-                "pre-fix",
-                "H2",
-                "scripts/sync-config.ts:syncDatasources:deleted-items",
-                "Datasource DELETE detection completed",
-                { count: deletedItems.length, names: deletedItems.map((ds: any) => dsName(ds)) }
-            );
             ctx.logMain(`Found ${deletedItems.length} Datasources to delete`);
 
             for (let r of deletedItems) {
@@ -958,32 +808,26 @@ export async function syncDatasourcesApplyAfterCredentials(
     }
 }
 
-export async function exportDatasourceCredentialForRestore(api: any, row: any, aesKeyName: string): Promise<any> {
+export async function exportDatasourceCredentialForRestore(
+    api: any,
+    row: any,
+    aesKeyName: string,
+): Promise<any> {
     const ds = row.systemname || row.datasource;
     const user = row.accessname || row.remoteusername;
     const grantee = row.grantee != null && row.grantee !== "" ? row.grantee : "@";
-
     const viaName = await io_utils.noThrow(
         io_db_credential.DBCredential.exportByName(api, ds, user, grantee, aesKeyName)
     );
-    // #region agent log
-    fetch('http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f538ee'},body:JSON.stringify({sessionId:'f538ee',runId:'cred-identity',hypothesisId:'H1',location:'scripts/sync/datasource-sync.ts:exportDatasourceCredentialForRestore:viaName',message:'Inspect exportByName identity fields',data:{input:{datasource:ds,accessname:user,grantee},viaName:{datasource:(viaName as any)?.systemname||(viaName as any)?.datasource||'',accessname:(viaName as any)?.accessname||(viaName as any)?.remoteusername||'',grantee:(viaName as any)?.grantee||'',hasPassword:!!(viaName as any)?.password,hasErrors:!!(viaName as any)?.errors}},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     if (viaName && !viaName.errors && viaName.password != null && String(viaName.password) !== "") {
         return viaName;
     }
     const cred = io_db_credential.DBCredential.build(row);
-    // #region agent log
-    fetch('http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f538ee'},body:JSON.stringify({sessionId:'f538ee',runId:'cred-identity',hypothesisId:'H2',location:'scripts/sync/datasource-sync.ts:exportDatasourceCredentialForRestore:build',message:'Inspect DBCredential.build identity fields',data:{input:{datasource:ds,accessname:user,grantee},built:{datasource:(cred as any)?.systemname||(cred as any)?.datasource||'',accessname:(cred as any)?.accessname||(cred as any)?.remoteusername||'',grantee:(cred as any)?.grantee||''}},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     const pw = await io_utils.noThrow(cred.exportPassword(api, aesKeyName));
     if (!pw || pw.errors) {
         return pw;
     }
     cred.password = pw;
-    // #region agent log
-    fetch('http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f538ee'},body:JSON.stringify({sessionId:'f538ee',runId:'cred-identity',hypothesisId:'H3',location:'scripts/sync/datasource-sync.ts:exportDatasourceCredentialForRestore:return',message:'Credential object returned for restore',data:{returning:{datasource:(cred as any)?.systemname||(cred as any)?.datasource||'',accessname:(cred as any)?.accessname||(cred as any)?.remoteusername||'',grantee:(cred as any)?.grantee||'',passwordType:Array.isArray((cred as any)?.password)?'array':typeof (cred as any)?.password}},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     return cred;
 }
 
@@ -1003,42 +847,16 @@ export async function syncDatasourceCredentials(ctx: SyncContext, api: any, apiK
     try {
         ctx.logMain("Starting Datasource Credentials synchronization...");
         const datasourceNames = await getFilteredDatasourceNames(ctx, api, apiKC);
-        emitDatasourceDebugLog(ctx, 
-            "pre-fix",
-            "H1",
-            "scripts/sync-config.ts:syncDatasourceCredentials:datasource-filter",
-            "Datasource names used to fetch credentials",
-            { datasourceCount: datasourceNames.length, datasourceNames }
-        );
-        let dataKJ = await listDatasourceCredentialsForDatasources(api, datasourceNames, true);
-        let dataKC = await listDatasourceCredentialsForDatasources(apiKC, datasourceNames, false);
+        let dataKJ = await listDatasourceCredentialsForDatasources(api, datasourceNames);
+        let dataKC = await listDatasourceCredentialsForDatasources(apiKC, datasourceNames);
         dataKJ = dataKJ.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
         dataKC = dataKC.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
-        emitDatasourceDebugLog(ctx, 
-            "pre-fix",
-            "H5",
-            "scripts/sync-config.ts:syncDatasourceCredentials:post-filter",
-            "Credential rows after datasource+credential filters",
-            {
-                sourceCount: dataKJ.length,
-                targetCount: dataKC.length,
-                sourceKeys: dataKJ.map((c: any) => credentialKey(c)),
-                targetKeys: dataKC.map((c: any) => credentialKey(c))
-            }
-        );
         let compareFunc = (s: any, t: any) => credentialKey(s) === credentialKey(t);
 
         // CREATE
         let newItems = arrayDiff(true, dataKJ, dataKC, compareFunc);
         newItems = newItems.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
         newItems = limitForTest(newItems);
-        emitDatasourceDebugLog(ctx, 
-            "pre-fix",
-            "H2",
-            "scripts/sync-config.ts:syncDatasourceCredentials:new-items",
-            "Datasource credential NEW detection completed",
-            { count: newItems.length, keys: newItems.map((c: any) => credentialKey(c)) }
-        );
         ctx.logMain(`Found ${newItems.length} Datasource Credentials to create`);
 
         for (let r of newItems) {
@@ -1059,34 +877,23 @@ export async function syncDatasourceCredentials(ctx: SyncContext, api: any, apiK
                     continue;
                 }
 
-                emitDatasourceDebugLog(ctx, 
-                    "pre-fix",
-                    "H4",
-                    "scripts/sync-config.ts:syncDatasourceCredentials:create-send",
-                    "Datasource credential create payload about to be sent",
-                    {
-                        key: credentialKey(r),
-                        datasource: r.systemname || r.datasource || "",
-                        accessname: r.accessname || "",
-                        grantee: r.grantee || "",
-                        hasExportedPassword: !!sourceCred.password
-                    }
-                );
-                // #region agent log
-                fetch('http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f538ee'},body:JSON.stringify({sessionId:'f538ee',runId:'cred-identity',hypothesisId:'H4',location:'scripts/sync/datasource-sync.ts:syncDatasourceCredentials:create:beforeRestore',message:'Compare intended key vs sourceCred restore identity',data:{intended:{key:credentialKey(r),datasource:r.systemname||r.datasource||'',accessname:r.accessname||r.remoteusername||'',grantee:r.grantee||'@'},restoreObject:{datasource:(sourceCred as any)?.systemname||(sourceCred as any)?.datasource||'',accessname:(sourceCred as any)?.accessname||(sourceCred as any)?.remoteusername||'',grantee:(sourceCred as any)?.grantee||''}},timestamp:Date.now()})}).catch(()=>{});
-                // #endregion
+                const intendDs = String(r.systemname || r.datasource || "");
+                const intendLogin = String(r.accessname || r.remoteusername || "");
+                const intendGrantee = r.grantee != null && r.grantee !== "" ? String(r.grantee) : "@";
                 let res = await io_utils.noThrow(sourceCred.restore(apiKC, aesKeyName));
-                emitDatasourceDebugLog(ctx, 
-                    "pre-fix",
-                    "H4",
-                    "scripts/sync-config.ts:syncDatasourceCredentials:create-result",
-                    "Datasource credential create API returned",
-                    { key: credentialKey(r), hasErrors: !!res?.errors, message: res?.message || "", resultType: typeof res }
-                );
                 if (res?.errors) {
                     logServerErrorPayload(ctx.logError, `Datasource Credential CREATE restore raw error payload (${credentialKey(r)})`, res);
                     ctx.logSyncAction("CREATE", "Datasource Credential", credentialKey(r), "error", formatServerErrorForLog(res));
                 } else {
+                    await assertTargetCredentialListedAfterRestore(
+                        ctx,
+                        apiKC,
+                        intendDs,
+                        intendLogin,
+                        intendGrantee,
+                        "CREATE",
+                        credentialKey(r),
+                    );
                     ctx.logSyncAction("CREATE", "Datasource Credential", credentialKey(r), "success");
                 }
             } catch (error) {
@@ -1132,17 +939,6 @@ export async function syncDatasourceCredentials(ctx: SyncContext, api: any, apiK
 
                     if (sourceEncrypted !== targetEncrypted ||
                         (sourceCred.credential_reset_days || "") !== (targetCred.credential_reset_days || "")) {
-                        emitDatasourceDebugLog(ctx, 
-                            "pre-fix",
-                            "H3",
-                            "scripts/sync-config.ts:syncDatasourceCredentials:update-detect",
-                            "Datasource credential marked as modified",
-                            {
-                                key: credentialKey(s),
-                                passwordDiff: sourceEncrypted !== targetEncrypted,
-                                resetDaysDiff: (sourceCred.credential_reset_days || "") !== (targetCred.credential_reset_days || "")
-                            }
-                        );
                         updatedItems.push(s);
                     }
                     break;
@@ -1152,13 +948,6 @@ export async function syncDatasourceCredentials(ctx: SyncContext, api: any, apiK
 
         updatedItems = updatedItems.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
         updatedItems = limitForTest(updatedItems);
-        emitDatasourceDebugLog(ctx, 
-            "pre-fix",
-            "H3",
-            "scripts/sync-config.ts:syncDatasourceCredentials:updated-items",
-            "Datasource credential UPDATE detection completed",
-            { count: updatedItems.length, keys: updatedItems.map((c: any) => credentialKey(c)) }
-        );
         ctx.logMain(`Found ${updatedItems.length} Datasource Credentials to update`);
 
         for (let r of updatedItems) {
@@ -1179,14 +968,23 @@ export async function syncDatasourceCredentials(ctx: SyncContext, api: any, apiK
                     continue;
                 }
 
-                // #region agent log
-                fetch('http://localhost:7868/ingest/3648e0b7-e289-4c74-8fe8-f262e3ea8657',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f538ee'},body:JSON.stringify({sessionId:'f538ee',runId:'cred-identity',hypothesisId:'H5',location:'scripts/sync/datasource-sync.ts:syncDatasourceCredentials:update:beforeRestore',message:'Update restore identity payload',data:{intended:{key:credentialKey(r),datasource:r.systemname||r.datasource||'',accessname:r.accessname||r.remoteusername||'',grantee:r.grantee||'@'},restoreObject:{datasource:(sourceCred as any)?.systemname||(sourceCred as any)?.datasource||'',accessname:(sourceCred as any)?.accessname||(sourceCred as any)?.remoteusername||'',grantee:(sourceCred as any)?.grantee||''}},timestamp:Date.now()})}).catch(()=>{});
-                // #endregion
+                const intendDsU = String(r.systemname || r.datasource || "");
+                const intendLoginU = String(r.accessname || r.remoteusername || "");
+                const intendGranteeU = r.grantee != null && r.grantee !== "" ? String(r.grantee) : "@";
                 let res = await io_utils.noThrow(sourceCred.restore(apiKC, aesKeyName));
                 if (res?.errors) {
                     logServerErrorPayload(ctx.logError, `Datasource Credential UPDATE restore raw error payload (${credentialKey(r)})`, res);
                     ctx.logSyncAction("UPDATE", "Datasource Credential", credentialKey(r), "error", formatServerErrorForLog(res));
                 } else {
+                    await assertTargetCredentialListedAfterRestore(
+                        ctx,
+                        apiKC,
+                        intendDsU,
+                        intendLoginU,
+                        intendGranteeU,
+                        "UPDATE",
+                        credentialKey(r),
+                    );
                     ctx.logSyncAction("UPDATE", "Datasource Credential", credentialKey(r), "success");
                 }
             } catch (error) {
@@ -1204,13 +1002,6 @@ export async function syncDatasourceCredentials(ctx: SyncContext, api: any, apiK
             let deletedItems = arrayDiff(true, dataKC, dataKJ, compareFunc);
             deletedItems = deletedItems.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred));
             deletedItems = limitForTest(deletedItems);
-            emitDatasourceDebugLog(ctx, 
-                "pre-fix",
-                "H2",
-                "scripts/sync-config.ts:syncDatasourceCredentials:deleted-items",
-                "Datasource credential DELETE detection completed",
-                { count: deletedItems.length, keys: deletedItems.map((c: any) => credentialKey(c)) }
-            );
             ctx.logMain(`Found ${deletedItems.length} Datasource Credentials to delete`);
 
             for (let r of deletedItems) {

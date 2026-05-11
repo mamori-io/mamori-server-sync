@@ -319,8 +319,8 @@ export async function generateCountSummary(ctx: SyncContext, api: any, apiKC: an
         if (shouldSync('datasource_credentials')) {
             try {
                 const datasourceNames = await getFilteredDatasourceNames(ctx, api, apiKC);
-                let sourceItems = await listDatasourceCredentialsForDatasources(api, datasourceNames, false);
-                let targetItems = await listDatasourceCredentialsForDatasources(apiKC, datasourceNames, false);
+                let sourceItems = await listDatasourceCredentialsForDatasources(api, datasourceNames);
+                let targetItems = await listDatasourceCredentialsForDatasources(apiKC, datasourceNames);
                 sourceItems = Array.isArray(sourceItems)
                     ? sourceItems.filter((cred: any) => shouldSyncDatasourceCredentialObject(cred))
                     : [];
