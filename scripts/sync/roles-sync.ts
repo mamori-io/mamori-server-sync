@@ -41,6 +41,13 @@ async function granteePresentOnTarget(
     return targetHasRoleId(grant.grantee, targetRoleIds);
 }
 
+/** API rows may expose `grantee_type`; legacy rows used `type` / `isdef`. */
+function granteeKindFromApiRow(grant: any): "role" | "user" {
+    const raw = grant?.type ?? grant?.grantee_type ?? (grant?.isdef === "Y" ? "role" : "user");
+    const s = String(raw).toLowerCase();
+    return s === "role" ? "role" : "user";
+}
+
 export async function syncRoles(ctx: SyncContext, api: any, apiKC: any): Promise<void> {
     if (!shouldSync('roles')) {
         ctx.logMain("ROLES SKIPPED (disabled in config)");
@@ -205,7 +212,7 @@ export async function syncRoleGrants(ctx: SyncContext, api: any, apiKC: any): Pr
                             roleid: roleId,
                             grantee: grant.grantee,
                             withadminoption: grant.withadminoption,
-                            type: grant.type || (grant.isdef === 'Y' ? 'role' : 'user')
+                            type: granteeKindFromApiRow(grant),
                         });
                     }
                 }
@@ -225,7 +232,7 @@ export async function syncRoleGrants(ctx: SyncContext, api: any, apiKC: any): Pr
                             roleid: roleId,
                             grantee: grant.grantee,
                             withadminoption: grant.withadminoption,
-                            type: grant.type || (grant.isdef === 'Y' ? 'role' : 'user')
+                            type: granteeKindFromApiRow(grant),
                         });
                     }
                 }

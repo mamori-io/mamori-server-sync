@@ -29,7 +29,7 @@
     "batch_size": 1000,
     "log_level": "info",
     "test_mode": true,
-    "test_limit": 3
+    "test_limit": 100
   },
   "sync_actions": {
     "sync-mamori-user-password": 1,
