@@ -213,23 +213,23 @@ export async function generateCountSummary(ctx: SyncContext, api: any, apiKC: an
             }
         }
 
-        // Roles
+        // Roles (counts restricted items only — same filter as roles-sync / object_filters.roles)
         if (shouldSync('roles')) {
             try {
                 let sourceRoles = await io_utils.noThrow(io_role.Role.getAll(api));
                 let targetRoles = await io_utils.noThrow(io_role.Role.getAll(apiKC));
-                
+
                 let sourceCount = 0;
                 let targetCount = 0;
-                
+
                 if (!sourceRoles.errors && Array.isArray(sourceRoles)) {
-                    sourceCount = sourceRoles.length;
+                    sourceCount = sourceRoles.filter((r: any) => shouldSyncObject('roles', r.roleid)).length;
                 }
-                
+
                 if (!targetRoles.errors && Array.isArray(targetRoles)) {
-                    targetCount = targetRoles.length;
+                    targetCount = targetRoles.filter((r: any) => shouldSyncObject('roles', r.roleid)).length;
                 }
-                
+
                 let status = sourceCount === targetCount ? "✓ MATCH" : "✗ MISMATCH";
                 summaryData.push({type: "Roles", source: sourceCount, target: targetCount, status});
             } catch (e) {
@@ -237,43 +237,54 @@ export async function generateCountSummary(ctx: SyncContext, api: any, apiKC: an
             }
         }
 
-        // Role Grants
+        // Role Grants (same rules as syncRoleGrants: common roles on both sides, then object_filters.role_grants on roleid + grantee)
         if (shouldSync('role_grants')) {
             try {
-                // Count role grants by getting all roles and their grants (only for common roles)
                 let sourceRoles = await io_utils.noThrow(io_role.Role.getAll(api));
                 let targetRoles = await io_utils.noThrow(io_role.Role.getAll(apiKC));
-                
+
                 let sourceCount = 0;
                 let targetCount = 0;
-                
+
                 if (!sourceRoles.errors && !targetRoles.errors && Array.isArray(sourceRoles) && Array.isArray(targetRoles)) {
-                    // Find common roles
-                    let sourceRoleIds = sourceRoles.map(r => r.roleid);
-                    let targetRoleIds = targetRoles.map(r => r.roleid);
-                    let commonRoleIds = sourceRoleIds.filter(id => targetRoleIds.includes(id));
-                    
-                    // Count grants only for common roles
+                    let sourceRoleIds = sourceRoles.map((r) => r.roleid);
+                    let targetRoleIds = targetRoles.map((r) => r.roleid);
+                    let commonRoleIds = sourceRoleIds.filter((id) => targetRoleIds.includes(id));
+
                     for (let roleId of commonRoleIds) {
                         try {
-                            // Source grants
                             let roleObj = new io_role.Role(roleId);
                             let sourceGrants = await io_utils.noThrow(roleObj.getGrantees(api));
                             if (!sourceGrants.errors && Array.isArray(sourceGrants)) {
-                                sourceCount += sourceGrants.length;
+                                for (let grant of sourceGrants) {
+                                    const rid = grant.roleid != null ? grant.roleid : roleId;
+                                    if (
+                                        shouldSyncObject('role_grants', rid) &&
+                                        shouldSyncObject('role_grants', grant.grantee)
+                                    ) {
+                                        sourceCount += 1;
+                                    }
+                                }
                             }
-                            
-                            // Target grants
+
                             let targetGrants = await io_utils.noThrow(roleObj.getGrantees(apiKC));
                             if (!targetGrants.errors && Array.isArray(targetGrants)) {
-                                targetCount += targetGrants.length;
+                                for (let grant of targetGrants) {
+                                    const rid = grant.roleid != null ? grant.roleid : roleId;
+                                    if (
+                                        shouldSyncObject('role_grants', rid) &&
+                                        shouldSyncObject('role_grants', grant.grantee)
+                                    ) {
+                                        targetCount += 1;
+                                    }
+                                }
                             }
                         } catch (e) {
                             // Ignore individual role errors
                         }
                     }
                 }
-                
+
                 let status = sourceCount === targetCount ? "✓ MATCH" : "✗ MISMATCH";
                 summaryData.push({type: "Role Grants", source: sourceCount, target: targetCount, status});
             } catch (e) {

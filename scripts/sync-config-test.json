@@ -17,9 +17,9 @@
     "datasource_credentials": 1,
     "ssh_logins": 0,
     "requestable_resources": 0,
-    "roles": 0,
-    "role_grants": 0,
-    "role_permissions": 0,
+    "roles": 1,
+    "role_grants": 1,
+    "role_permissions": 1,
     "on_demand_policies": 0
   },
   "sync_options": {
@@ -53,6 +53,20 @@
     ],
     "datasources": [
       "^oracle193b$"
+    ],
+    "datasource_credentials": [
+      "^oracle193b\\|"
+    ],
+    "roles": [
+      "^atestrole$",
+      "^after_hour_access$"
+    ],
+    "role_grants": [],
+    "permissions": [
+      "^om01$",
+      "^om02$",
+      "^om03$",
+      "^atestrole$"
     ]
   }
 }

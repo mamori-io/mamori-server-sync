@@ -32,6 +32,15 @@ export function shouldSyncObject(objectType: string, objectName: string): boolea
     });
 }
 
+/**
+ * Direct permission sync (`syncDirectPermissions`): which grantee names to include.
+ * Same pattern list applies to both Mamori usernames and role ids. If `object_filters.permissions`
+ * is missing or empty, all grantees are included (same semantics as `shouldSyncObject`).
+ */
+export function shouldSyncPermissionGrantee(grantee: string): boolean {
+    return shouldSyncObject('permissions', grantee || '');
+}
+
 export function shouldSyncDatasourceCredentialObject(credential: any): boolean {
     const datasourceName = credential.systemname || credential.datasource || "";
     const credentialIdentity = `${datasourceName}|${credential.accessname || ""}|${credential.grantee || ""}`;
@@ -126,6 +135,11 @@ export function shouldDeleteRemoved(): boolean {
     return syncConfig.sync_options && syncConfig.sync_options.delete_removed === true;
 }
 
+/**
+ * In test mode, caps how many items are processed per batch.
+ * Apply `shouldSyncObject` / object_filters before calling this so `test_limit` applies to the
+ * filtered set (otherwise an arbitrary prefix of unfiltered rows may exclude configured patterns).
+ */
 export function limitForTest<T>(items: T[]): T[] {
     if (isTestMode()) {
         const limit = getTestLimit();

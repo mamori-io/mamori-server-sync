@@ -8,6 +8,39 @@ import {
     shouldSyncObject,
 } from "./filters";
 
+/** Case-insensitive: does `id` appear in the list of role ids from Role.getAll? */
+function targetHasRoleId(roleId: string, targetRoleIds: string[]): boolean {
+    const want = roleId.toLowerCase();
+    return targetRoleIds.some((id) => id.toLowerCase() === want);
+}
+
+/**
+ * Grantees can be users (SYS.ALL_USERS) or roles (nested grants). SDK Role.getGrantees documents `type`: role | user.
+ * The sync previously only checked ALL_USERS, so role→role grants were always skipped as "grantee does not exist".
+ */
+async function granteePresentOnTarget(
+    apiKC: any,
+    grant: { grantee: string; type?: string },
+    targetRoleIds: string[],
+): Promise<boolean> {
+    const typ = String(grant.type ?? "user").toLowerCase();
+    if (typ === "role") {
+        return targetHasRoleId(grant.grantee, targetRoleIds);
+    }
+    try {
+        const safe = String(grant.grantee).replace(/'/g, "''");
+        const userCheckQuery = `SELECT username FROM SYS.ALL_USERS WHERE username='${safe}'`;
+        const userCheckResult = await io_utils.noThrow(apiKC.select(userCheckQuery));
+        if (!userCheckResult.errors && Array.isArray(userCheckResult) && userCheckResult.length > 0) {
+            return true;
+        }
+    } catch {
+        /* fall through */
+    }
+    // API sometimes omits `type`; grantee may still be a role id present on target.
+    return targetHasRoleId(grant.grantee, targetRoleIds);
+}
+
 export async function syncRoles(ctx: SyncContext, api: any, apiKC: any): Promise<void> {
     if (!shouldSync('roles')) {
         ctx.logMain("ROLES SKIPPED (disabled in config)");
@@ -18,7 +51,7 @@ export async function syncRoles(ctx: SyncContext, api: any, apiKC: any): Promise
         ctx.logMain("Starting roles synchronization...");
         let dataKJ = await io_utils.noThrow(io_role.Role.getAll(api));
         let dataKC = await io_utils.noThrow(io_role.Role.getAll(apiKC));
-        
+
         // Handle the response structure
         if (dataKJ.errors || dataKC.errors) {
             ctx.logError(`Failed to get roles: ${dataKJ.message || dataKC.message}`);
@@ -30,15 +63,14 @@ export async function syncRoles(ctx: SyncContext, api: any, apiKC: any): Promise
         
         let compareFunc = (s: any, t: any) => s.roleid === t.roleid;
         
-        // Create new roles
+        // Create new roles (apply object_filters before test_mode cap so patterns like ^atestrole$ are not dropped)
         let newItems = arrayDiff(true, dataKJ, dataKC, compareFunc);
-        newItems = limitForTest(newItems);
         newItems = newItems.filter((role: any) => shouldSyncObject('roles', role.roleid));
+        newItems = limitForTest(newItems);
         
         ctx.logMain(`Found ${newItems.length} new roles to create`);
         for (let r of newItems) {
             try {
-                ctx.logMain(`Creating role: ${r.roleid}`);
                 let role = new io_role.Role(r.roleid, r.externalname || '');
                 if (r.withadminoption === 'Y') {
                     role.withadminoption = 'Y';
@@ -96,8 +128,8 @@ export async function syncRoles(ctx: SyncContext, api: any, apiKC: any): Promise
         // Delete roles that exist on target but not on source
         if (shouldDeleteRemoved()) {
         let deletedItems = arrayDiff(true, dataKC, dataKJ, compareFunc);
-            deletedItems = limitForTest(deletedItems);
             deletedItems = deletedItems.filter((role: any) => shouldSyncObject('roles', role.roleid));
+            deletedItems = limitForTest(deletedItems);
             
             ctx.logMain(`Found ${deletedItems.length} roles to delete`);
         for (let r of deletedItems) {
@@ -210,27 +242,26 @@ export async function syncRoleGrants(ctx: SyncContext, api: any, apiKC: any): Pr
             return s.roleid === t.roleid && s.grantee === t.grantee;
         };
 
-        // Find new role grants to create
+        // Find new role grants to create (filter before test_mode cap)
         let newGrants = arrayDiff(true, sourceRoleGrants, targetRoleGrants, compareFunc);
-        newGrants = limitForTest(newGrants);
-
-        // Apply name filters
-        let filteredNewGrants = newGrants.filter(grant =>
-            shouldSyncObject('role_grants', grant.roleid) && 
-            shouldSyncObject('role_grants', grant.grantee)
+        let filteredNewGrants = newGrants.filter(
+            (grant) =>
+                shouldSyncObject('role_grants', grant.roleid) &&
+                shouldSyncObject('role_grants', grant.grantee),
         );
-
-        ctx.logMain(`Found ${newGrants.length} new role grants to create`);
         if (filteredNewGrants.length !== newGrants.length) {
             ctx.logMain(`Filtered to ${filteredNewGrants.length} role grants based on name filters`);
         }
+        filteredNewGrants = limitForTest(filteredNewGrants);
+
+        ctx.logMain(`Found ${filteredNewGrants.length} new role grants to create`);
 
         for (let grant of filteredNewGrants) {
             try {
                 ctx.logMain(`Creating role grant: ${grant.roleid} -> ${grant.grantee} (${grant.type})`);
 
-                // Validate that the role exists on target server
-                let roleExists = targetRoleIds.includes(grant.roleid);
+                // Validate that the granted role exists on target (case-insensitive: source/target casing may differ)
+                let roleExists = targetHasRoleId(grant.roleid, targetRoleIds);
                 if (!roleExists) {
                     let errorMsg = `Role '${grant.roleid}' could not be granted to '${grant.grantee}'. The role is missing.`;
                     ctx.logSyncAction("CREATE", "Role Grant", `${grant.roleid}->${grant.grantee}`, "error", errorMsg);
@@ -238,20 +269,11 @@ export async function syncRoleGrants(ctx: SyncContext, api: any, apiKC: any): Pr
                     continue;
                 }
 
-                // Validate that the grantee exists on target server
-                let granteeExists = false;
-                try {
-                    let userCheckQuery = `SELECT username FROM SYS.ALL_USERS WHERE username='${grant.grantee}'`;
-                    let userCheckResult = await io_utils.noThrow(apiKC.select(userCheckQuery));
-                    if (!userCheckResult.errors && Array.isArray(userCheckResult) && userCheckResult.length > 0) {
-                        granteeExists = true;
-                    }
-                } catch (userCheckError) {
-                    ctx.logError(`Failed to check if grantee '${grant.grantee}' exists: ${userCheckError}`);
-                }
+                // Grantee is a user (ALL_USERS) or another role (must exist on target)
+                let granteeExists = await granteePresentOnTarget(apiKC, grant, targetRoleIds);
 
                 if (!granteeExists) {
-                    let errorMsg = `Role '${grant.roleid}' could not be granted. Grantee '${grant.grantee}' does not exist.`;
+                    let errorMsg = `Role '${grant.roleid}' could not be granted. Grantee '${grant.grantee}' (${grant.type || "user"}) does not exist on target.`;
                     ctx.logSyncAction("CREATE", "Role Grant", `${grant.roleid}->${grant.grantee}`, "error", errorMsg);
                     ctx.logError(errorMsg);
                     continue;
@@ -277,27 +299,25 @@ export async function syncRoleGrants(ctx: SyncContext, api: any, apiKC: any): Pr
             }
         }
 
-        // Find role grants to delete (present on target but not on source)
+        // Find role grants to delete (present on target but not on source; filter before test_mode cap)
         let deleteGrants = arrayDiff(true, targetRoleGrants, sourceRoleGrants, compareFunc);
-        deleteGrants = limitForTest(deleteGrants);
-
-        // Apply name filters
-        let filteredDeleteGrants = deleteGrants.filter(grant =>
-            shouldSyncObject('role_grants', grant.roleid) && 
-            shouldSyncObject('role_grants', grant.grantee)
+        let filteredDeleteGrants = deleteGrants.filter(
+            (grant) =>
+                shouldSyncObject('role_grants', grant.roleid) &&
+                shouldSyncObject('role_grants', grant.grantee),
         );
-
-        ctx.logMain(`Found ${deleteGrants.length} role grants to delete`);
         if (filteredDeleteGrants.length !== deleteGrants.length) {
             ctx.logMain(`Filtered to ${filteredDeleteGrants.length} role grants based on name filters`);
         }
+        filteredDeleteGrants = limitForTest(filteredDeleteGrants);
+
+        ctx.logMain(`Found ${filteredDeleteGrants.length} role grants to delete`);
 
         for (let grant of filteredDeleteGrants) {
             try {
                 ctx.logMain(`Deleting role grant: ${grant.roleid} -> ${grant.grantee}`);
 
-                // Validate that the role exists on target server
-                let roleExists = targetRoleIds.includes(grant.roleid);
+                let roleExists = targetHasRoleId(grant.roleid, targetRoleIds);
                 if (!roleExists) {
                     let errorMsg = `Role '${grant.roleid}' could not be revoked from '${grant.grantee}'. The role is missing.`;
                     ctx.logSyncAction("DELETE", "Role Grant", `${grant.roleid}->${grant.grantee}`, "error", errorMsg);
@@ -305,20 +325,10 @@ export async function syncRoleGrants(ctx: SyncContext, api: any, apiKC: any): Pr
                     continue;
                 }
 
-                // Validate that the grantee exists on target server
-                let granteeExists = false;
-                try {
-                    let userCheckQuery = `SELECT username FROM SYS.ALL_USERS WHERE username='${grant.grantee}'`;
-                    let userCheckResult = await io_utils.noThrow(apiKC.select(userCheckQuery));
-                    if (!userCheckResult.errors && Array.isArray(userCheckResult) && userCheckResult.length > 0) {
-                        granteeExists = true;
-                    }
-                } catch (userCheckError) {
-                    ctx.logError(`Failed to check if grantee '${grant.grantee}' exists: ${userCheckError}`);
-                }
+                let granteeExists = await granteePresentOnTarget(apiKC, grant, targetRoleIds);
 
                 if (!granteeExists) {
-                    let errorMsg = `Role '${grant.roleid}' could not be revoked from '${grant.grantee}'. Grantee does not exist.`;
+                    let errorMsg = `Role '${grant.roleid}' could not be revoked from '${grant.grantee}'. Grantee (${grant.type || "user"}) does not exist on target.`;
                     ctx.logSyncAction("DELETE", "Role Grant", `${grant.roleid}->${grant.grantee}`, "error", errorMsg);
                     ctx.logError(errorMsg);
                     continue;

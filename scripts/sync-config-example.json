@@ -80,6 +80,11 @@
     ],
     "role_grants": [],
     "role_permissions": [],
+    "permissions": [
+      ".*admin.*",
+      "readonly",
+      ".*manager.*"
+    ],
     "alert_channels": [
       "email.*",
       "slack.*",
